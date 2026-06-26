@@ -41,6 +41,7 @@ from rich.table import Table
 
 from agent_hub.manifest import AgentManifest, discover_from_registry
 from agent_hub.bridge import AgentProcessRegistry, CLIBridge
+from agent_hub.dashboard import _agent_icon
 
 logging.basicConfig(
     level=logging.WARNING,
