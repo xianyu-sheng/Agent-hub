@@ -220,6 +220,22 @@ class CLIBridge:
         params = params or {}
         timeout = timeout or self.default_timeout
 
+        # internal 协议防御：内部 Agent 不应通过子进程执行
+        # 这由 AgentScheduler._execute_single_task 在调度层拦截，
+        # 此处的检查是防御深度——若有人直接调用 bridge.execute(internal_agent, ...)
+        # 会得到明确的错误信息而非未定义行为。
+        if manifest.protocol == "internal":
+            return AgentResult(
+                agent_name=manifest.name,
+                task_name=task_name,
+                success=False,
+                error=(
+                    f"Agent '{manifest.name}' 使用 internal 协议，"
+                    f"不能通过 CLI Bridge 子进程执行。"
+                    f"任务 '{task_name}' 应由 AgentScheduler 在进程内分派。"
+                ),
+            )
+
         # 检查 manifest 约束中的 timeout
         if "timeout" in manifest.capabilities.constraints:
             timeout = min(timeout, manifest.capabilities.constraints["timeout"])

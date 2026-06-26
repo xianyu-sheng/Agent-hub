@@ -341,14 +341,9 @@ class AgentScheduler:
 
                 dash.refresh()
 
-                # 并行执行波内任务
+                # 并行执行波内任务（统一分派：内部/外部）
                 tasks_coros = [
-                    self.bridge.execute(
-                        manifest=agents[task.agent],
-                        task_name=task.task,
-                        params=task.params,
-                        on_stdout=lambda line, ag=task.agent: dash.get_panel(ag).append(line),
-                    )
+                    self._execute_single_task(task, agents, dash)
                     for task in wave
                 ]
                 results = await asyncio.gather(*tasks_coros, return_exceptions=True)
@@ -362,13 +357,7 @@ class AgentScheduler:
                             error=str(result),
                         )
                     else:
-                        exec_result = TaskExecutionResult(
-                            task=task,
-                            success=result.success,
-                            output=result.output,
-                            error=result.error,
-                            duration_ms=result.duration_ms,
-                        )
+                        exec_result = result
 
                     task_results.append(exec_result)
 
@@ -425,11 +414,7 @@ class AgentScheduler:
             )
 
             tasks_coros = [
-                self.bridge.execute(
-                    manifest=agents[task.agent],
-                    task_name=task.task,
-                    params=task.params,
-                )
+                self._execute_single_task(task, agents)
                 for task in wave
             ]
             results = await asyncio.gather(*tasks_coros, return_exceptions=True)
@@ -439,18 +424,12 @@ class AgentScheduler:
                     exec_result = TaskExecutionResult(task=task, success=False, error=str(result))
                     self.console.print(f"  [red]✗[/red] [{task.agent}] {task.task}: {result}")
                 else:
-                    exec_result = TaskExecutionResult(
-                        task=task,
-                        success=result.success,
-                        output=result.output,
-                        error=result.error,
-                        duration_ms=result.duration_ms,
-                    )
+                    exec_result = result
                     status = "✓" if result.success else "✗"
                     color = "green" if result.success else "red"
                     self.console.print(
                         f"  [{color}]{status}[/{color}] [{task.agent}] {task.task} "
-                        f"({result.duration_ms:.0f}ms)"
+                        f"({exec_result.duration_ms:.0f}ms)"
                     )
 
                 task_results.append(exec_result)
@@ -527,6 +506,165 @@ class AgentScheduler:
             for r in task_results
         )
 
+    # ── 内部任务分派 ───────────────────────────────────────────
+
+    async def _execute_single_task(
+        self,
+        task: RoutedTask,
+        agents: dict[str, AgentManifest],
+        dash: AgentDashboard | None = None,
+    ) -> TaskExecutionResult:
+        """统一的任务执行入口 — 根据 protocol 分派到内部或外部执行。
+
+        内部协议 (protocol=internal)：进程内调度，不生成子进程（避免递归）
+        外部协议 (protocol=cli/mcp/http)：通过 CLIBridge 子进程执行
+        """
+        manifest = agents.get(task.agent)
+        if not manifest:
+            return TaskExecutionResult(
+                task=task,
+                success=False,
+                error=f"Agent '{task.agent}' 未注册",
+            )
+
+        if manifest.protocol == "internal":
+            return await self._run_internal_task(task, manifest)
+
+        # 外部 Agent — CLI Bridge 子进程执行
+        result = await self.bridge.execute(
+            manifest=manifest,
+            task_name=task.task,
+            params=task.params,
+            on_stdout=(
+                lambda line, ag=task.agent: dash.get_panel(ag).append(line)
+                if dash else None
+            ),
+        )
+        return TaskExecutionResult(
+            task=task,
+            success=result.success,
+            output=result.output,
+            error=result.error,
+            duration_ms=result.duration_ms,
+        )
+
+    async def _run_internal_task(
+        self,
+        task: RoutedTask,
+        manifest: AgentManifest,
+    ) -> TaskExecutionResult:
+        """在进程内执行 internal 协议 Agent 的任务。
+
+        不生成子进程 — 直接调用 AgentScheduler 自身的方法。
+        这是防止 agent-hub 自调用时产生无限递归的关键机制。
+        """
+        import json
+        import time as time_mod
+
+        start_time = time_mod.monotonic()
+
+        try:
+            if task.task == "route_task":
+                # 调用 LLM 路由器分解意图为跨 Agent DAG
+                plan = await self.router.route(
+                    task.params.get("goal", ""),
+                    self._agents,
+                    extra_context=task.params.get("context", ""),
+                )
+                output = json.dumps(plan.to_dict(), ensure_ascii=False, indent=2)
+
+            elif task.task == "manage_agents":
+                action = task.params.get("action", "status")
+                agent_names = task.params.get("agent_names", [])
+                output = await self._handle_manage_agents(action, agent_names)
+
+            elif task.task == "discover_capabilities":
+                ags = self._agents if self._agents else self._load_agents()
+                filt = (task.params.get("filter") or "").lower()
+                lines = []
+                for name, m in sorted(ags.items()):
+                    if filt and filt not in name.lower() and filt not in m.display_name.lower():
+                        continue
+                    tasks_str = ", ".join(t.name for t in m.capabilities.tasks)
+                    lines.append(
+                        f"{name} ({m.display_name}): "
+                        f"{len(m.capabilities.tasks)} tasks [{tasks_str}]"
+                    )
+                output = "\n".join(lines) if lines else "No agents match the filter."
+
+            elif task.task == "aggregate_results":
+                output = await self._aggregate(
+                    task.params.get("user_input", ""),
+                    task.params.get("results", []),
+                    task.params.get("analysis", ""),
+                )
+
+            else:
+                raise ValueError(
+                    f"Unknown internal task: {task.task}. "
+                    f"Available: route_task, manage_agents, discover_capabilities, aggregate_results"
+                )
+
+        except Exception as e:
+            duration_ms = (time_mod.monotonic() - start_time) * 1000
+            logger.error("内部任务 %s 失败: %s", task.task, e, exc_info=True)
+            return TaskExecutionResult(
+                task=task, success=False, error=str(e), duration_ms=duration_ms,
+            )
+
+        duration_ms = (time_mod.monotonic() - start_time) * 1000
+        return TaskExecutionResult(
+            task=task, success=True, output=str(output), duration_ms=duration_ms,
+        )
+
+    async def _handle_manage_agents(
+        self, action: str, agent_names: list[str],
+    ) -> str:
+        """处理 manage_agents 内部任务。
+
+        Args:
+            action: start | stop | restart | status
+            agent_names: Agent 名列表（空 = 全部）
+        """
+        agents = self._agents if self._agents else self._load_agents()
+
+        if agent_names:
+            targets = {n: m for n, m in agents.items() if n in agent_names}
+        else:
+            targets = agents
+
+        if not targets:
+            return "No matching agents found."
+
+        if action == "status":
+            lines = []
+            for name in sorted(targets):
+                info = self.bridge.registry.get(name)
+                status = info.status if info else "unknown"
+                pid = str(info.pid) if info and info.pid else "N/A"
+                lines.append(f"{name}: {status} (pid={pid})")
+            return "\n".join(lines) if lines else "No agents found."
+
+        elif action == "start":
+            results = await self.bridge.start_all(list(targets.values()))
+            ok = sum(1 for r in results.values() if r.is_running)
+            return f"Started {ok}/{len(results)} agents."
+
+        elif action == "stop":
+            for name in list(targets):
+                await self.bridge.stop_agent(name)
+            return f"Stopped {len(targets)} agents."
+
+        elif action == "restart":
+            for name in list(targets):
+                await self.bridge.stop_agent(name)
+            results = await self.bridge.start_all(list(targets.values()))
+            ok = sum(1 for r in results.values() if r.is_running)
+            return f"Restarted {ok}/{len(results)} agents."
+
+        else:
+            return f"Unknown action: {action}. Available: start, stop, restart, status"
+
     # ── 便捷方法 ─────────────────────────────────────────────────
 
     async def execute_single(
@@ -552,6 +690,16 @@ class AgentScheduler:
         self.console.print(
             f"[dim]🎯 直接调用: [{agent_name}] {task_name}[/dim]"
         )
+
+        # 内部协议 Agent 走进程内调度
+        if agent.protocol == "internal":
+            task = RoutedTask(
+                id=0, agent=agent_name, task=task_name,
+                description=f"直接调用 {task_name}",
+                params=params or {},
+            )
+            exec_result = await self._run_internal_task(task, agent)
+            return exec_result.output if exec_result.success else exec_result.error
 
         result = await self.bridge.execute(
             manifest=agent,
