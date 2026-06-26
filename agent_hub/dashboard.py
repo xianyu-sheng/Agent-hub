@@ -392,22 +392,19 @@ class AgentDashboard:
             )
         )
 
-        # 主体分为：左列（任务图 + Agent 面板）+ 右列（数据流 + 结果）
-        body = Layout()
-        body.split_row(
+        # 主体：左右分栏（直接在 root["body"] 内 split，避免 Layout 赋值）
+        root["body"].split_row(
             Layout(name="left", ratio=3),
             Layout(name="right", ratio=2),
         )
 
         # 左列：任务图 + Agent 面板（上下分）
-        left = Layout()
-        # 动态分配：任务图固定 6 行，剩下给 Agent 面板
-        left.split(
+        root["body"]["left"].split(
             Layout(name="task_graph", size=min(6 + len(self.task_graph.nodes), 12)),
             Layout(name="agent_outputs"),
         )
 
-        left["task_graph"].update(
+        root["body"]["left"]["task_graph"].update(
             Panel(
                 self.task_graph.render(),
                 title="📋 任务 DAG",
@@ -423,7 +420,7 @@ class AgentDashboard:
         else:
             agent_renderables.append(Text("  (等待 Agent 启动...)", style="dim"))
 
-        left["agent_outputs"].update(
+        root["body"]["left"]["agent_outputs"].update(
             Panel(
                 _join_vertically(agent_renderables),
                 title="🤖 Agent 实时输出",
@@ -431,14 +428,13 @@ class AgentDashboard:
             )
         )
 
-        # 右列：数据流 + 结果
-        right = Layout()
-        right.split(
+        # 右列：数据流 + 结果（上下分）
+        root["body"]["right"].split(
             Layout(name="dataflow", size=12),
             Layout(name="result"),
         )
 
-        right["dataflow"].update(
+        root["body"]["right"]["dataflow"].update(
             Panel(
                 self.dataflow.render(),
                 title="📡 数据流转日志",
@@ -452,17 +448,13 @@ class AgentDashboard:
         else:
             result_content = Text("  (等待任务完成...)", style="dim")
 
-        right["result"].update(
+        root["body"]["right"]["result"].update(
             Panel(
                 result_content,
                 title="📊 最终输出",
                 border_style="white",
             )
         )
-
-        body["left"] = left
-        body["right"] = right
-        root["body"] = body
 
         return root
 
@@ -619,8 +611,8 @@ class HealthDashboard:
         )
 
         # Body: Agent 状态（左）+ 健康事件日志（右）
-        body = Layout()
-        body.split_row(
+        # 直接在 root["body"] 内 split_row，避免 root["body"] = body 的赋值错误
+        root["body"].split_row(
             Layout(name="agent_status", ratio=2),
             Layout(name="health_log", ratio=1),
         )
@@ -677,7 +669,7 @@ class HealthDashboard:
         if not agent_panels:
             agent_panels.append(Text("  (无已注册的 Agent)", style="dim"))
 
-        body["agent_status"].update(
+        root["body"]["agent_status"].update(
             Panel(
                 _join_vertically(agent_panels),
                 title="🤖 Agent Status",
@@ -691,7 +683,7 @@ class HealthDashboard:
         else:
             log_text = Text("  (等待健康检查...)", style="dim")
 
-        body["health_log"].update(
+        root["body"]["health_log"].update(
             Panel(
                 log_text,
                 title="📡 Health Events",
@@ -699,7 +691,6 @@ class HealthDashboard:
             )
         )
 
-        root["body"] = body
         return root
 
 

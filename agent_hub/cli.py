@@ -97,6 +97,7 @@ def _start_repl() -> None:
     import shlex
 
     from click.testing import CliRunner
+    from rich.prompt import Prompt as RichPrompt
 
     # ── 欢迎页（静态渲染一次）──────────────────────────────────────
     _print_welcome_banner()
@@ -106,10 +107,8 @@ def _start_repl() -> None:
 
     while True:
         try:
-            raw = click.prompt(
-                "",
-                prompt_suffix="[bold cyan]agent-hub[/] [bold green]>[/] ",
-            )
+            # 使用 Rich Prompt 以正确渲染颜色/样式标记
+            raw = RichPrompt.ask("[bold cyan]agent-hub[/] [bold green]>[/]")
             line = raw.strip()
             if not line:
                 continue
@@ -140,17 +139,18 @@ def _start_repl() -> None:
                 continue
 
             # CliRunner 捕获 SystemExit，不会杀死 REPL
-            # 但 confirm/prompt 需要真实终端交互 → mix_stderr=False
-            result = runner.invoke(
-                main, args,
-                catch_exceptions=False,  # 让 click.confirm 等能直面用户
-                standalone_mode=False,   # 不调用 sys.exit
-            )
-            # 如果命令执行失败（内部 sys.exit(1)），SystemExit 会被
-            # standalone_mode=False 抑制。如果仍有异常则捕获。
-            if result.exit_code != 0 and result.output:
-                # CliRunner 的 output 已经包含 Click 的错误输出
-                pass  # Click 已自行打印错误
+            try:
+                result = runner.invoke(
+                    main, args,
+                    catch_exceptions=False,  # 让 click.confirm 等能直面用户
+                    standalone_mode=False,   # 不调用 sys.exit
+                )
+            except SystemExit:
+                # Click 命令内部调用 sys.exit(1) 等，不要杀死 REPL
+                continue
+            except Exception as exc:
+                console.print(f"[red]✗ 命令执行失败: {exc}[/red]")
+                continue
 
         except KeyboardInterrupt:
             console.print("\n[dim]按 Ctrl+C 再次或输入 quit 退出[/dim]")
@@ -159,7 +159,7 @@ def _start_repl() -> None:
             # 某些命令可能仍触发了 sys.exit，不要杀死 REPL
             continue
         except Exception as e:
-            console.print(f"[red]✗ 命令执行异常: {e}[/red]")
+            console.print(f"[red]✗ 内部错误: {e}[/red]")
             continue
 
 
