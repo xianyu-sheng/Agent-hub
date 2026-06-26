@@ -87,6 +87,7 @@ class AgentProcessRegistry:
 
     def __init__(self) -> None:
         self._processes: dict[str, ProcessInfo] = {}
+        self._monitor_tasks: dict[str, asyncio.Task] = {}
 
     def register(
         self,
@@ -116,7 +117,11 @@ class AgentProcessRegistry:
             self._processes[name].status = status
 
     def remove(self, name: str) -> None:
-        """从注册表移除 Agent。"""
+        """从注册表移除 Agent 及其监控任务。"""
+        # 取消该 Agent 的后台监控任务，防止资源泄漏
+        task = self._monitor_tasks.pop(name, None)
+        if task and not task.done():
+            task.cancel()
         self._processes.pop(name, None)
 
     def list_all(self) -> list[ProcessInfo]:
@@ -275,14 +280,24 @@ class CLIBridge:
                 await asyncio.wait_for(process.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 logger.warning("Agent %s 任务 %s 超时 (%ds)，正在终止", manifest.name, task_name, timeout)
+
+                # 优雅终止 → 强制终止 → 确认进程退出
                 try:
                     process.terminate()
                     await asyncio.wait_for(process.wait(), timeout=5)
-                except Exception:
+                except (asyncio.TimeoutError, Exception):
+                    # SIGTERM 未响应，发送 SIGKILL
                     try:
                         process.kill()
+                        # 必须 await 确保进程被回收，否则会成为僵尸进程
+                        await asyncio.wait_for(process.wait(), timeout=3)
                     except Exception:
-                        pass
+                        pass  # 最终尝试，忽略所有错误
+
+                # 取消流读取任务 — 进程已终止，继续读取只会无限等待
+                for task in (stdout_task, stderr_task):
+                    if not task.done():
+                        task.cancel()
 
                 duration_ms = (time.monotonic() - start_time) * 1000
                 return AgentResult(
@@ -507,8 +522,12 @@ class CLIBridge:
 
             info = self.registry.register(name, process, manifest)
 
-            # 启动后台任务监控进程
-            asyncio.create_task(self._monitor_agent_process(name, on_stdout))
+            # 启动后台任务监控进程 — 存储引用防止异常静默丢失
+            task = asyncio.create_task(
+                self._monitor_agent_process(name, on_stdout),
+                name=f"monitor-{name}",
+            )
+            self.registry._monitor_tasks[name] = task
 
             # 等待短暂时间检查进程是否存活
             await asyncio.sleep(0.5)
@@ -560,7 +579,10 @@ class CLIBridge:
         name: str,
         on_stdout: Callable[[str], None] | None = None,
     ) -> None:
-        """后台监控 Agent 进程的 stdout/stderr 和退出状态。"""
+        """后台监控 Agent 进程的 stdout/stderr 和退出状态。
+
+        异常安全：内部捕获所有异常，确保监控任务不会静默失败。
+        """
         info = self.registry.get(name)
         if not info or not info.process:
             return
@@ -572,38 +594,53 @@ class CLIBridge:
             callback: Callable[[str], None] | None,
         ) -> None:
             if stream is None or callback is None:
-                # 静默消费
+                # 静默消费输出流，防止子进程管道阻塞
                 if stream:
-                    while True:
-                        line = await stream.readline()
-                        if not line:
-                            break
+                    try:
+                        while True:
+                            line = await stream.readline()
+                            if not line:
+                                break
+                    except Exception:
+                        pass  # 管道关闭等异常，安全忽略
                 return
-            while True:
-                line_bytes = await stream.readline()
-                if not line_bytes:
-                    break
-                line = line_bytes.decode("utf-8", errors="replace").rstrip("\n\r")
-                callback(line)
+            try:
+                while True:
+                    line_bytes = await stream.readline()
+                    if not line_bytes:
+                        break
+                    line = line_bytes.decode("utf-8", errors="replace").rstrip("\n\r")
+                    try:
+                        callback(line)
+                    except Exception:
+                        pass  # 回调异常不中断流读取
+            except Exception:
+                pass  # 管道关闭等异常
 
         stdout_task = asyncio.create_task(
             read_and_callback(process.stdout, on_stdout)
         )
         stderr_task = asyncio.create_task(
-            read_and_callback(process.stderr, None)  # stderr 记录到日志
+            read_and_callback(process.stderr, None)  # stderr 静默消费
         )
 
-        # 等待进程退出
-        await process.wait()
-        await asyncio.gather(stdout_task, stderr_task)
+        try:
+            # 等待进程退出
+            await process.wait()
+        except Exception:
+            logger.warning("Agent %s 进程等待异常", name, exc_info=True)
+
+        # 等待流读取任务完成（避免资源泄漏）
+        try:
+            await asyncio.gather(stdout_task, stderr_task)
+        except Exception:
+            pass
 
         if process.returncode != 0:
             logger.warning(
                 "Agent %s 退出 (exit=%d)", name, process.returncode,
             )
-            self.registry.update_status(name, "stopped")
-        else:
-            self.registry.update_status(name, "stopped")
+        self.registry.update_status(name, "stopped")
 
     async def stop_agent(self, name: str) -> bool:
         """优雅终止指定 Agent。

@@ -474,7 +474,15 @@ def _run_task(task: str, no_dashboard: bool, timeout: int):
 
 
 def _generate_agent_yaml_template(project_name: str, project_path: Path) -> str:
-    """为新项目生成 agent.yaml 模板。"""
+    """为新项目生成 agent.yaml 模板。
+
+    注意：Windows 路径使用 as_posix() 转换为正斜杠格式，
+    避免反斜杠被 YAML 解析器解释为转义序列（如 \\r → 回车）。
+    """
+    # 转换为正斜杠路径，防止 YAML 转义问题
+    # 例如 D:\\工作\\resume-sync 中的 \\r 会被 YAML 读成回车符
+    safe_path = project_path.resolve().as_posix()
+
     return f"""# Agent Manifest — {project_name} 的自描述清单
 # 此文件供 Agent-hub 读取，永不修改。配置变更请手动编辑。
 
@@ -500,5 +508,5 @@ capabilities:
   # modes: [react]
 
 interface:
-  command: cd {project_path.resolve()} && python -m {project_name} --json-output "{{goal}}"
+  command: cd {safe_path} && python -m {project_name} --json-output "{{goal}}"
 """

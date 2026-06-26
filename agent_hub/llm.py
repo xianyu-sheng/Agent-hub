@@ -64,6 +64,9 @@ def chat_completion(
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return data["choices"][0]["message"]["content"]
+    except (KeyboardInterrupt, SystemExit):
+        # 不吞掉系统信号 — 让进程能正常退出
+        raise
     except Exception:
         logger.debug("LLM 调用失败: model=%s", model_id, exc_info=True)
         return None

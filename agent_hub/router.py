@@ -354,8 +354,12 @@ class IntentRouter:
     def _fuzzy_match_task(
         target: str,
         agent: AgentManifest,
-    ) -> AgentManifest | None:
-        """模糊匹配任务名（当 LLM 输出的任务名不完全匹配时）。"""
+    ) -> AgentTask | None:
+        """模糊匹配任务名（当 LLM 输出的任务名不完全匹配时）。
+
+        Returns:
+            匹配到的 AgentTask，或 None（未匹配）
+        """
         from agent_hub.manifest import AgentTask
 
         target_lower = target.lower().replace(" ", "_").replace("-", "_")

@@ -390,13 +390,13 @@ class AgentScheduler:
 
                 dash.refresh()
 
-        # 汇总
+        # 汇总 — 在仪表盘内完成，避免退出 Live 后用户看到空白终端
+        # 先显示"汇总中"状态，然后调用 LLM，最后更新结果面板
+        dash.set_result("⏳ 正在汇总各 Agent 结果...")
+        dash.refresh()
         aggregate = await self._aggregate(user_input, task_results, route_plan.analysis)
         dash.set_result(aggregate)
-
-        # 最后一次刷新展示结果
-        with dash.run():
-            dash.refresh()
+        dash.refresh()
 
         return SchedulerResult(
             user_input=user_input,
