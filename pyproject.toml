@@ -1,0 +1,24 @@
+[project]
+name = "agent-hub"
+version = "0.1.0"
+description = "解耦的多 Agent 调度系统 + 可视化数据流仪表盘"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "click>=8.0",
+]
+
+[project.scripts]
+agent-hub = "agent_hub.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
