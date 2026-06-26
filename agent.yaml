@@ -1,0 +1,74 @@
+# Agent Manifest — Agent Hub 的自描述清单
+# 此文件是 Agent-hub 自己的配置入口，包含模型注册和任务声明。
+# 修改后运行: agent-hub agent reload
+
+name: agent-hub
+display_name: "Agent Hub Scheduler"
+description: |
+  多 Agent 中央调度系统。核心能力：
+  1. 意图路由 — LLM 将自然语言任务分解为跨 Agent DAG
+  2. DAG 调度 — Kahn 拓扑排序 + 波次并行执行
+  3. Agent 生命周期管理 — 一键启停所有注册的 Agent
+  4. 结果汇总 — LLM 整合多 Agent 输出为连贯结论
+  通过 agent.yaml 发现专业 Agent，零侵入集成。
+protocol: internal          # internal = 进程内调度，不生成子进程（避免递归）
+version: "1.0"
+
+capabilities:
+  tasks:
+    - name: route_task
+      description: |
+        接收用户自然语言任务描述，通过 LLM 意图路由器分解为跨 Agent 的任务 DAG。
+        自动匹配可用 Agent 的能力，确定任务间依赖关系。
+      input:
+        goal: "string — 用户任务描述（如：分析 omniagent 代码质量并更新简历）"
+        context: "string — 可选，额外上下文信息"
+      output:
+        route_plan: "object — {tasks: [{id, agent, task, params, depends_on}], analysis, agents_involved}"
+
+    - name: manage_agents
+      description: |
+        管理已注册 Agent 的进程生命周期：启动、停止、查看状态。
+        支持操作所有 Agent 或指定列表。
+      input:
+        action: "string — start | stop | restart | status"
+        agent_names: "list — 要操作的 Agent 名列表（空 = 全部）"
+      output:
+        result: "string — 操作结果摘要"
+
+    - name: discover_capabilities
+      description: |
+        扫描 agents.d/ 注册目录，列出所有已注册 Agent 及其任务能力。
+        用于 LLM 路由前的 Agent 发现和能力查询。
+      input:
+        filter: "string — 可选，按关键词过滤 Agent 名或显示名"
+      output:
+        agents: "list — [{name, display_name, task_count, tasks}]"
+
+    - name: aggregate_results
+      description: |
+        接收多个 Agent 的任务执行结果，通过 LLM 整合为连贯的最终结论。
+        支持失败降级：LLM 不可用时自动拼接原始结果。
+      input:
+        user_input: "string — 原始用户请求"
+        results: "list — [{agent, task, success, output, error}]"
+        analysis: "string — 路由分析摘要"
+      output:
+        summary: "string — 整合后的最终回答"
+
+  models:
+    # —————— 模型注册入口 ——————
+    # Agent-hub 支持的所有 LLM 模型在此声明。
+    # 通过 agent-hub models 命令管理，或手动编辑后 agent-hub agent reload
+    # API Key 通过环境变量配置（推荐）或 agent-hub models 命令设置
+    - deepseek-v4-pro
+    - claude-sonnet-4-6
+
+  modes: [react]
+  constraints:
+    max_concurrency: 5
+    timeout: 300
+
+interface:
+  # internal 协议的 command 不会被实际调用，仅用于通过验证
+  command: internal://dispatch

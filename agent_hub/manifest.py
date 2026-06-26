@@ -237,7 +237,8 @@ class AgentManifest:
             errors.append("name 是必填字段")
         if not self.capabilities.tasks:
             errors.append("capabilities.tasks 不能为空 — 至少声明一个任务")
-        if not self.interface.command:
+        # internal 协议不需要 CLI command（在进程内调度，不生成子进程）
+        if self.protocol != "internal" and not self.interface.command:
             errors.append("interface.command 是必填字段 — 指定 CLI 调用命令")
 
         # 验证每个 task 的必填字段
