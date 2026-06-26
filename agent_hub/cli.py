@@ -83,22 +83,95 @@ def _get_model_priority() -> list[str]:
     ).split(",")
 
 
-def _show_welcome() -> None:
-    """显示 Agent-hub 启动欢迎页（默认命令）。
+def _start_repl() -> None:
+    """启动 Agent-hub 交互式命令中心（默认命令）。
 
-    自动检测系统状态（Agent 注册、模型配置），
-    通过 Rich Live 展示系统概览和快速开始指南。
-    按 Ctrl+C 退出。
+    显示系统概览后进入 REPL 循环，用户可直接输入命令：
+    - models add/remove/list    — 配置 LLM 模型
+    - agent register/list/info  — 管理专业 Agent
+    - start/stop/status         — 控制 Agent 系统
+    - run <任务>                — 执行多 Agent 任务
+    - help                      — 命令帮助
+    - quit                      — 退出
     """
-    from agent_hub.dashboard import WelcomeDashboard
+    import shlex
+
+    from click.testing import CliRunner
+
+    # ── 欢迎页（静态渲染一次）──────────────────────────────────────
+    _print_welcome_banner()
+
+    # ── REPL 循环 ──────────────────────────────────────────────────
+    runner = CliRunner()
+
+    while True:
+        try:
+            raw = click.prompt(
+                "",
+                prompt_suffix="[bold cyan]agent-hub[/] [bold green]>[/] ",
+            )
+            line = raw.strip()
+            if not line:
+                continue
+
+            # 退出
+            if line.lower() in ("quit", "exit", "q"):
+                console.print("[dim]👋 再见！[/dim]")
+                break
+
+            # 本地命令（不需要走 Click）
+            if line.lower() == "help" or line == "?":
+                _repl_help()
+                continue
+            if line.lower() == "status":
+                _print_welcome_banner()
+                continue
+            if line.lower() == "clear" or line.lower() == "cls":
+                console.clear()
+                _print_welcome_banner()
+                continue
+
+            # ── 委托给 Click CliRunner ──
+            try:
+                args = shlex.split(line)
+            except ValueError as e:
+                console.print(f"[red]✗ 参数解析错误: {e}[/red]")
+                console.print("[dim]提示: 包含空格的参数请用引号包裹[/dim]")
+                continue
+
+            # CliRunner 捕获 SystemExit，不会杀死 REPL
+            # 但 confirm/prompt 需要真实终端交互 → mix_stderr=False
+            result = runner.invoke(
+                main, args,
+                catch_exceptions=False,  # 让 click.confirm 等能直面用户
+                standalone_mode=False,   # 不调用 sys.exit
+            )
+            # 如果命令执行失败（内部 sys.exit(1)），SystemExit 会被
+            # standalone_mode=False 抑制。如果仍有异常则捕获。
+            if result.exit_code != 0 and result.output:
+                # CliRunner 的 output 已经包含 Click 的错误输出
+                pass  # Click 已自行打印错误
+
+        except KeyboardInterrupt:
+            console.print("\n[dim]按 Ctrl+C 再次或输入 quit 退出[/dim]")
+            continue
+        except SystemExit:
+            # 某些命令可能仍触发了 sys.exit，不要杀死 REPL
+            continue
+        except Exception as e:
+            console.print(f"[red]✗ 命令执行异常: {e}[/red]")
+            continue
+
+
+def _print_welcome_banner() -> None:
+    """打印系统概览欢迎横幅（静态，不阻塞）。"""
     from agent_hub.model_config import ModelConfigStore
 
-    # 加载系统状态
     agents_dict = _load_all_agents()
     model_store = ModelConfigStore()
     model_entries = model_store.list_all()
 
-    # 检查是否有持久化的运行中进程
+    # 检查运行状态
     system_running = False
     try:
         from agent_hub.pid_store import PidFileStore
@@ -108,40 +181,127 @@ def _show_welcome() -> None:
     except Exception:
         pass
 
-    # 构建 WelcomeDashboard
-    dash = WelcomeDashboard(console, title="Agent Hub — 多 Agent 中央调度系统")
+    # ── Header ──
+    console.print()
+    console.rule("[bold white]🔄 Agent Hub — 多 Agent 中央调度系统[/]")
+    console.print(f"[dim]v0.1.0 · 直接输入命令操作 · 输入 help 查看帮助 · quit 退出[/dim]")
+    console.print()
 
-    # 填充 Agent 状态
-    for name, manifest in sorted(agents_dict.items()):
-        dash.agents_status.append({
-            "name": name,
-            "icon": _agent_icon(name),
-            "status": "❌" if not manifest.is_valid else "✅",
-            "protocol": manifest.protocol,
-            "tasks": len(manifest.capabilities.tasks),
-        })
+    # ── 系统概览表 ──
+    table = Table(title="📋 系统概览", border_style="cyan")
+    table.add_column("项目", style="bold", width=14)
+    table.add_column("详情")
 
-    # 填充模型状态
-    for entry in model_entries:
-        dash.models_list.append({
-            "name": entry.name,
-            "provider": entry.provider,
-            "default": entry.default,
-        })
+    # Agent 行
+    if agents_dict:
+        agent_lines = []
+        for name, m in sorted(agents_dict.items()):
+            icon = _agent_icon(name)
+            status_icon = "✅" if m.is_valid else "❌"
+            agent_lines.append(
+                f"{icon} [cyan]{name}[/cyan] {status_icon} "
+                f"[dim]({m.protocol}, {len(m.capabilities.tasks)} tasks)[/dim]"
+            )
+        table.add_row("已注册 Agent", "\n".join(agent_lines))
+    else:
+        table.add_row("已注册 Agent", "[dim](无) — 使用 agent register <路径> 注册[/dim]")
 
-    dash.system_running = system_running
+    # 模型行
+    if model_entries:
+        model_lines = []
+        for entry in model_entries:
+            star = "⭐ " if entry.default else "  "
+            prov = f" ({entry.provider})" if entry.provider else ""
+            model_lines.append(f"{star}[green]{entry.name}[/green]{prov}")
+        table.add_row("已配置模型", "\n".join(model_lines))
+    else:
+        table.add_row("已配置模型", "[dim](无) — 使用 models add ... 配置[/dim]")
 
-    # 显示欢迎页（Live 模式，按 Ctrl+C 退出）
-    console.print()  # 空行分隔
-    try:
-        with dash.run():
-            dash.refresh()
-            # 保持显示直到用户按 Ctrl+C
-            import time
-            while True:
-                time.sleep(0.5)
-    except KeyboardInterrupt:
-        console.print("\n[dim]👋 再见！输入 agent-hub --help 查看所有命令[/dim]\n")
+    # 系统状态行
+    if system_running:
+        table.add_row("系统状态", "[green]🟢 运行中[/green]")
+    else:
+        table.add_row("系统状态", "[dim]⚫ 未启动[/dim]")
+
+    console.print(table)
+
+    # ── 上下文提示 ──
+    if not model_entries:
+        tip = (
+            "[yellow]💡 检测到未配置模型，请先添加:[/yellow]\n"
+            "   models add [cyan]deepseek-v4-pro[/cyan] "
+            "--api-base [green]https://api.deepseek.com[/green] "
+            "--api-key-env [green]DEEPSEEK_API_KEY[/green]"
+        )
+    elif not agents_dict or len(agents_dict) <= 1:
+        tip = (
+            "[yellow]💡 提示:[/yellow] "
+            "使用 [bold]agent register <项目路径>[/bold] 注册专业 Agent，"
+            "或 [bold]models add[/bold] 添加更多模型"
+        )
+    elif not system_running:
+        tip = (
+            "[yellow]💡 已就绪:[/yellow] "
+            "输入 [bold]start[/bold] 启动 Agent 系统，"
+            "或 [bold]run \"任务描述\"[/bold] 直接执行任务"
+        )
+    else:
+        tip = (
+            "[yellow]💡 系统运行中:[/yellow] "
+            "输入 [bold]run \"任务描述\"[/bold] 执行任务，"
+            "[bold]stop[/bold] 停止系统，[bold]status[/bold] 查看状态"
+        )
+    console.print(f"\n{tip}")
+    console.print()
+
+
+def _repl_help() -> None:
+    """打印 REPL 帮助信息。"""
+    from rich.columns import Columns
+
+    console.print()
+    console.rule("[bold]📖 可用命令[/bold]")
+    console.print()
+
+    commands = [
+        ("[bold cyan]模型配置[/bold cyan]", ""),
+        ("  models list", "列出已配置的 LLM 模型"),
+        ("  models add <name> --api-base <url> --api-key-env <VAR>", "添加模型（支持 --provider, --set-default）"),
+        ("  models remove <name>", "删除模型"),
+        ("  models info <name>", "模型详情"),
+        ("  models priority [--set a,b,c]", "查看/设置模型优先级"),
+        ("", ""),
+        ("[bold cyan]Agent 管理[/bold cyan]", ""),
+        ("  agent list", "列出所有已注册 Agent"),
+        ("  agent info <name>", "查看 Agent 详情"),
+        ("  agent register <项目路径>", "注册新 Agent"),
+        ("  agent validate", "验证所有 agent.yaml"),
+        ("  agent models [name]", "查看 Agent 声明的模型"),
+        ("", ""),
+        ("[bold cyan]系统控制[/bold cyan]", ""),
+        ("  start", "启动所有 Agent（进入健康监控面板）"),
+        ("  stop", "停止所有 Agent"),
+        ("  status", "刷新系统概览"),
+        ("", ""),
+        ("[bold cyan]任务执行[/bold cyan]", ""),
+        ("  run <任务描述>", "执行多 Agent 任务（自然语言）"),
+        ("  run", "进入交互式任务模式"),
+        ("", ""),
+        ("[bold cyan]其他[/bold cyan]", ""),
+        ("  help / ?", "显示此帮助"),
+        ("  clear / cls", "清屏"),
+        ("  quit / exit / q", "退出 Agent-hub"),
+    ]
+
+    for cmd, desc in commands:
+        if cmd:
+            console.print(f"  {cmd:<52} [dim]{desc}[/dim]")
+        else:
+            console.print()
+
+    console.print()
+    console.print("[dim]提示: 包含空格的参数请用引号包裹，如 run \"分析代码并更新简历\"[/dim]")
+    console.print()
 
 
 # ── CLI 入口组 ──────────────────────────────────────────────────────
@@ -159,8 +319,8 @@ def main(ctx):
     直接运行 agent-hub（无子命令）进入启动欢迎页，查看系统状态和快速开始指南。
     """
     if ctx.invoked_subcommand is None:
-        # 无子命令 → 启动欢迎页
-        _show_welcome()
+        # 无子命令 → 启动交互式命令中心 (REPL)
+        _start_repl()
 
 
 # ── start / stop / status ────────────────────────────────────────────
