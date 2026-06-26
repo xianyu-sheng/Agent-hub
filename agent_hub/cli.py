@@ -83,17 +83,84 @@ def _get_model_priority() -> list[str]:
     ).split(",")
 
 
+def _show_welcome() -> None:
+    """显示 Agent-hub 启动欢迎页（默认命令）。
+
+    自动检测系统状态（Agent 注册、模型配置），
+    通过 Rich Live 展示系统概览和快速开始指南。
+    按 Ctrl+C 退出。
+    """
+    from agent_hub.dashboard import WelcomeDashboard
+    from agent_hub.model_config import ModelConfigStore
+
+    # 加载系统状态
+    agents_dict = _load_all_agents()
+    model_store = ModelConfigStore()
+    model_entries = model_store.list_all()
+
+    # 检查是否有持久化的运行中进程
+    system_running = False
+    try:
+        from agent_hub.pid_store import PidFileStore
+        pid_store = PidFileStore()
+        existing = pid_store.load_all()
+        system_running = len(existing) > 0
+    except Exception:
+        pass
+
+    # 构建 WelcomeDashboard
+    dash = WelcomeDashboard(console, title="Agent Hub — 多 Agent 中央调度系统")
+
+    # 填充 Agent 状态
+    for name, manifest in sorted(agents_dict.items()):
+        dash.agents_status.append({
+            "name": name,
+            "icon": _agent_icon(name),
+            "status": "❌" if not manifest.is_valid else "✅",
+            "protocol": manifest.protocol,
+            "tasks": len(manifest.capabilities.tasks),
+        })
+
+    # 填充模型状态
+    for entry in model_entries:
+        dash.models_list.append({
+            "name": entry.name,
+            "provider": entry.provider,
+            "default": entry.default,
+        })
+
+    dash.system_running = system_running
+
+    # 显示欢迎页（Live 模式，按 Ctrl+C 退出）
+    console.print()  # 空行分隔
+    try:
+        with dash.run():
+            dash.refresh()
+            # 保持显示直到用户按 Ctrl+C
+            import time
+            while True:
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        console.print("\n[dim]👋 再见！输入 agent-hub --help 查看所有命令[/dim]\n")
+
+
 # ── CLI 入口组 ──────────────────────────────────────────────────────
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.version_option(version="0.1.0", prog_name="agent-hub")
-def main():
+@click.pass_context
+def main(ctx):
     """Agent Hub — 解耦的多 Agent 调度系统 + 可视化数据流仪表盘。
 
     通过 agent.yaml 清单发现专业 Agent，支持 DAG 并行调度和实时可视化。
+
+    \b
+    直接运行 agent-hub（无子命令）进入启动欢迎页，查看系统状态和快速开始指南。
     """
-    pass
+    if ctx.invoked_subcommand is None:
+        # 无子命令 → 启动欢迎页
+        _show_welcome()
 
 
 # ── start / stop / status ────────────────────────────────────────────

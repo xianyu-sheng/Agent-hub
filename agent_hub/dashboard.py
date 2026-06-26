@@ -701,3 +701,230 @@ class HealthDashboard:
 
         root["body"] = body
         return root
+
+
+# ── 欢迎/启动仪表盘 ────────────────────────────────────────────────
+
+
+class WelcomeDashboard:
+    """Agent-hub 启动欢迎页 — 默认命令 (agent-hub 无参数) 的交互界面。
+
+    与 HealthDashboard（进程健康监控）和 AgentDashboard（任务执行可视化）不同，
+    WelcomeDashboard 专注于**引导新用户上手** + **展示系统当前状态**：
+
+    布局结构:
+    ┌──────────────────────────────────────────────────┐
+    │  🔄 Agent Hub — 多 Agent 中央调度系统  v0.1.0      │
+    │  按 Ctrl+C 退出 | --help 查看全部命令              │
+    ├──────────────────────┬───────────────────────────┤
+    │  📋 系统概览          │  🚀 快速开始               │
+    │                      │                           │
+    │  已注册 Agent (4)    │  1️⃣ 配置 LLM 模型          │
+    │    🔄 agent-hub  ✅  │  2️⃣ 注册专业 Agent         │
+    │    🔍 omniagent  ✅  │  3️⃣ 启动 Agent 系统        │
+    │    ...               │  4️⃣ 执行任务               │
+    │                      │                           │
+    │  已配置模型 (1)      │  📖 查看所有命令            │
+    │    ⭐ deepseek-v4    │                           │
+    │                      │                           │
+    │  系统状态: 未启动     │                           │
+    ├──────────────────────┴───────────────────────────┤
+    │  💡 <上下文提示>                                  │
+    └──────────────────────────────────────────────────┘
+
+    使用方式：
+        dash = WelcomeDashboard(console)
+        with dash.run():
+            dash.refresh()
+            # 等待用户按 Ctrl+C 或输入命令
+    """
+
+    def __init__(
+        self,
+        console: Console,
+        *,
+        title: str = "Agent Hub — 多 Agent 中央调度系统",
+        refresh_per_second: int = 4,
+    ) -> None:
+        self.console = console
+        self.title = title
+        self.refresh_per_second = refresh_per_second
+
+        # 系统状态（由调用者在 run() 前填充）
+        self.agents_status: list[dict] = []  # [{name, icon, status, protocol, tasks}]
+        self.models_list: list[dict] = []    # [{name, provider, default}]
+        self.system_running: bool = False
+        self.tip: str = ""
+
+        self._live: Live | None = None
+
+    def run(self) -> Live:
+        """创建 Rich Live 上下文管理器。"""
+        self._live = Live(
+            self._build_layout(),
+            console=self.console,
+            refresh_per_second=self.refresh_per_second,
+            transient=False,
+        )
+        return self._live
+
+    def refresh(self) -> None:
+        """手动刷新仪表盘。"""
+        if self._live:
+            self._live.update(self._build_layout())
+
+    def _build_layout(self) -> Layout:
+        """构建欢迎页布局。"""
+        root = Layout()
+        root.split(
+            Layout(name="header", size=3),
+            Layout(name="body"),
+            Layout(name="footer", size=3),
+        )
+
+        # ── Header ──
+        header_text = (
+            f"[bold white]{self.title}[/bold white]\n"
+            f"[dim]v0.1.0 · 解耦的多 Agent 调度系统[/dim]"
+        )
+        root["header"].update(
+            Panel(Align.center(header_text), style="bold blue")
+        )
+
+        # ── Body: 左右分栏 ──
+        root["body"].split_row(
+            Layout(name="overview", ratio=1),
+            Layout(name="quickstart", ratio=1),
+        )
+
+        root["body"]["overview"].update(self._build_overview_panel())
+        root["body"]["quickstart"].update(self._build_quickstart_panel())
+
+        # ── Footer: 上下文提示 ──
+        tip = self.tip or self._auto_tip()
+        root["footer"].update(
+            Panel(
+                Align.center(f"[bold yellow]💡 {tip}[/bold yellow]"),
+                style="yellow",
+            )
+        )
+
+        return root
+
+    def _build_overview_panel(self) -> Panel:
+        """构建系统概览面板（左栏）。"""
+        lines: list[str] = []
+
+        # ── Agent 注册状态 ──
+        agent_count = len(self.agents_status)
+        lines.append(f"[bold]已注册 Agent[/bold] ({agent_count})")
+        if self.agents_status:
+            for a in self.agents_status:
+                icon = a.get("icon", "🤖")
+                name = a["name"]
+                status_icon = a.get("status", "✅")
+                protocol = a.get("protocol", "")
+                tasks = a.get("tasks", 0)
+                lines.append(
+                    f"  {icon} [cyan]{name}[/cyan]  {status_icon}  "
+                    f"[dim]{protocol} · {tasks} tasks[/dim]"
+                )
+        else:
+            lines.append("  [dim](无已注册 Agent)[/dim]")
+            lines.append("  [dim]使用 agent-hub agent register 注册[/dim]")
+
+        lines.append("")
+
+        # ── 模型配置状态 ──
+        model_count = len(self.models_list)
+        lines.append(f"[bold]已配置模型[/bold] ({model_count})")
+        if self.models_list:
+            for m in self.models_list:
+                name = m["name"]
+                provider = m.get("provider", "")
+                is_default = m.get("default", False)
+                star = "⭐ " if is_default else "  "
+                prov_str = f" ({provider})" if provider else ""
+                lines.append(f"  {star}[green]{name}[/green]{prov_str}")
+        else:
+            lines.append("  [dim](未配置模型)[/dim]")
+            lines.append("  [dim]使用 agent-hub models add 配置[/dim]")
+
+        lines.append("")
+
+        # ── 系统运行状态 ──
+        if self.system_running:
+            lines.append("[bold]系统状态:[/bold] [green]🟢 运行中[/green]")
+        else:
+            lines.append("[bold]系统状态:[/bold] [dim]⚫ 未启动[/dim]")
+
+        content = Text("\n".join(lines))
+        return Panel(content, title="📋 系统概览", border_style="cyan")
+
+    def _build_quickstart_panel(self) -> Panel:
+        """构建快速开始面板（右栏）。"""
+        lines: list[str] = []
+
+        lines.append("[bold]1️⃣  配置 LLM 模型[/bold]")
+        lines.append("[dim]注册模型供应商和 API Key[/dim]")
+        lines.append("")
+        lines.append("  [yellow]$[/yellow] [bold]agent-hub models add[/bold] \\")
+        lines.append("      [cyan]deepseek-v4-pro[/cyan] \\")
+        lines.append("      --api-base [green]https://api.deepseek.com[/green] \\")
+        lines.append("      --api-key-env [green]DEEPSEEK_API_KEY[/green]")
+        lines.append("")
+        lines.append("[dim]更多: agent-hub models --help[/dim]")
+
+        lines.append("")
+        lines.append("[bold]2️⃣  注册专业 Agent[/bold]")
+        lines.append("[dim]将 Agent 项目注册到调度系统[/dim]")
+        lines.append("")
+        lines.append("  [yellow]$[/yellow] [bold]agent-hub agent register[/bold] \\")
+        lines.append("      [green]<项目路径>[/green]")
+        lines.append("")
+        lines.append("[dim]示例: agent-hub agent register D:/OmniAgent_CLI[/dim]")
+        lines.append("[dim]更多: agent-hub agent --help[/dim]")
+
+        lines.append("")
+        lines.append("[bold]3️⃣  启动 Agent 系统[/bold]")
+        lines.append("[dim]一键拉起所有注册的 Agent 进程[/dim]")
+        lines.append("")
+        lines.append("  [yellow]$[/yellow] [bold]agent-hub start[/bold]")
+
+        lines.append("")
+        lines.append("[bold]4️⃣  执行任务[/bold]")
+        lines.append("[dim]自然语言描述，自动路由到 Agent[/dim]")
+        lines.append("")
+        lines.append("  [yellow]$[/yellow] [bold]agent-hub run[/bold] \\")
+        lines.append('      [green]"分析代码质量并更新简历"[/green]')
+
+        lines.append("")
+        lines.append("[dim]📖 查看所有命令:[/dim] [bold]agent-hub --help[/bold]")
+
+        content = Text("\n".join(lines))
+        return Panel(content, title="🚀 快速开始", border_style="green")
+
+    def _auto_tip(self) -> str:
+        """根据当前系统状态自动生成上下文提示。"""
+        agent_count = len(self.agents_status)
+        model_count = len(self.models_list)
+
+        if model_count == 0:
+            return (
+                "首次使用？请先配置 LLM 模型: "
+                "agent-hub models add deepseek-v4-pro --api-base https://api.deepseek.com --api-key-env DEEPSEEK_API_KEY"
+            )
+        if agent_count == 0:
+            return (
+                "已配置模型，下一步请注册 Agent: "
+                "agent-hub agent register <项目路径>"
+            )
+        if not self.system_running:
+            return (
+                f"已就绪: {agent_count} 个 Agent + {model_count} 个模型。"
+                " 运行 agent-hub start 启动系统，或 agent-hub run \"任务\" 直接执行"
+            )
+        return (
+            f"系统运行中: {agent_count} 个 Agent。"
+            " 使用 agent-hub run \"任务\" 执行任务，agent-hub status 查看状态"
+        )
