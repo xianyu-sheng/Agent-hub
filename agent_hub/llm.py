@@ -2,10 +2,12 @@
 
 不依赖 omniagent，独立实现 OpenAI-compatible chat completion。
 支持从 ModelConfigStore 读取配置或从环境变量回退。
+所有公共函数均为 async — 使用 asyncio.to_thread 将阻塞 HTTP 调用卸载到线程池。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -15,7 +17,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def chat_completion(
+async def chat_completion(
     model_id: str,
     messages: list[dict[str, Any]],
     *,
@@ -25,7 +27,10 @@ def chat_completion(
     base_url: str | None = None,
     timeout: int = 60,
 ) -> str | None:
-    """调用 OpenAI-compatible chat completion API。
+    """调用 OpenAI-compatible chat completion API（异步）。
+
+    使用 asyncio.to_thread 将阻塞的 HTTP 请求卸载到线程池，
+    避免阻塞事件循环。
 
     Args:
         model_id: 模型 ID（如 "deepseek-v4-pro", "claude-sonnet-4-6"）
@@ -46,10 +51,12 @@ def chat_completion(
 
     base_url = base_url or os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com")
 
-    return _do_chat_completion(model_id, messages, api_key, base_url, max_tokens, temperature, timeout)
+    return await asyncio.to_thread(
+        _do_chat_completion, model_id, messages, api_key, base_url, max_tokens, temperature, timeout,
+    )
 
 
-def chat_completion_from_config(
+async def chat_completion_from_config(
     model_id: str,
     messages: list[dict[str, Any]],
     *,
@@ -57,7 +64,7 @@ def chat_completion_from_config(
     temperature: float = 0.3,
     timeout: int = 60,
 ) -> str | None:
-    """从 ModelConfigStore 读取模型配置并调用 chat completion。
+    """从 ModelConfigStore 读取模型配置并调用 chat completion（异步）。
 
     优先使用 models.yaml 中的 api_base 和 api_key，
     若无匹配则回退到环境变量。
@@ -83,14 +90,14 @@ def chat_completion_from_config(
             base_url = entry.api_base
             if api_key and base_url:
                 logger.debug("使用 models.yaml 配置: model=%s api_base=%s", model_id, base_url)
-                return _do_chat_completion(
-                    model_id, messages, api_key, base_url, max_tokens, temperature, timeout,
+                return await asyncio.to_thread(
+                    _do_chat_completion, model_id, messages, api_key, base_url, max_tokens, temperature, timeout,
                 )
     except Exception:
         logger.debug("从 models.yaml 读取配置失败，回退到环境变量", exc_info=True)
 
     # 回退：使用原始方法（环境变量）
-    return chat_completion(
+    return await chat_completion(
         model_id, messages,
         max_tokens=max_tokens, temperature=temperature, timeout=timeout,
     )
@@ -105,7 +112,7 @@ def _do_chat_completion(
     temperature: float,
     timeout: int,
 ) -> str | None:
-    """执行实际的 HTTP 请求（内部函数）。"""
+    """执行实际的 HTTP 请求（同步函数，供 asyncio.to_thread 调用）。"""
     url = f"{base_url.rstrip('/')}/v1/chat/completions"
 
     body = json.dumps({
