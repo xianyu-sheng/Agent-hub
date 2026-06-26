@@ -1,0 +1,9 @@
+# Agent Hub 注册文件 — SmartBench
+# 由 agent-hub agent register D:/SmartBench 生成
+# 可手动编辑 project_path 指向你的项目位置
+
+project_path: D:/SmartBench
+
+# Agent: 代码诊断引擎
+# 协议: cli
+# 任务数: 3 (diagnose_code, benchmark_performance, fingerprint_project)
