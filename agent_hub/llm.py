@@ -1,6 +1,7 @@
 """轻量 LLM 客户端 — Agent-hub 的 LLM 调用封装。
 
 不依赖 omniagent，独立实现 OpenAI-compatible chat completion。
+支持从 ModelConfigStore 读取配置或从环境变量回退。
 """
 
 from __future__ import annotations
@@ -45,6 +46,66 @@ def chat_completion(
 
     base_url = base_url or os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com")
 
+    return _do_chat_completion(model_id, messages, api_key, base_url, max_tokens, temperature, timeout)
+
+
+def chat_completion_from_config(
+    model_id: str,
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int = 2048,
+    temperature: float = 0.3,
+    timeout: int = 60,
+) -> str | None:
+    """从 ModelConfigStore 读取模型配置并调用 chat completion。
+
+    优先使用 models.yaml 中的 api_base 和 api_key，
+    若无匹配则回退到环境变量。
+
+    Args:
+        model_id: 模型 ID（需匹配 ModelConfigStore 中注册的模型名）
+        messages: 消息列表
+        max_tokens: 最大生成 token 数
+        temperature: 温度
+        timeout: 超时秒数
+
+    Returns:
+        模型回复文本，失败返回 None
+    """
+    try:
+        from agent_hub.model_config import ModelConfigStore
+
+        store = ModelConfigStore()
+        entry = store.get(model_id)
+
+        if entry:
+            api_key = entry.resolved_api_key
+            base_url = entry.api_base
+            if api_key and base_url:
+                logger.debug("使用 models.yaml 配置: model=%s api_base=%s", model_id, base_url)
+                return _do_chat_completion(
+                    model_id, messages, api_key, base_url, max_tokens, temperature, timeout,
+                )
+    except Exception:
+        logger.debug("从 models.yaml 读取配置失败，回退到环境变量", exc_info=True)
+
+    # 回退：使用原始方法（环境变量）
+    return chat_completion(
+        model_id, messages,
+        max_tokens=max_tokens, temperature=temperature, timeout=timeout,
+    )
+
+
+def _do_chat_completion(
+    model_id: str,
+    messages: list[dict[str, Any]],
+    api_key: str,
+    base_url: str,
+    max_tokens: int,
+    temperature: float,
+    timeout: int,
+) -> str | None:
+    """执行实际的 HTTP 请求（内部函数）。"""
     url = f"{base_url.rstrip('/')}/v1/chat/completions"
 
     body = json.dumps({

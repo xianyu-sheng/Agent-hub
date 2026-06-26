@@ -221,12 +221,12 @@ class IntentRouter:
 
     async def _call_llm(self, messages: list[dict]) -> str:
         """调用 LLM，按 model_priority 尝试。"""
-        from agent_hub.llm import chat_completion
+        from agent_hub.llm import chat_completion_from_config
 
         last_error = None
         for model_id in self.model_priority:
             try:
-                result = chat_completion(
+                result = chat_completion_from_config(
                     model_id=model_id,
                     messages=messages,
                     max_tokens=2048,

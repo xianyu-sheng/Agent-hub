@@ -507,10 +507,10 @@ class AgentScheduler:
         ]
 
         try:
-            from agent_hub.llm import chat_completion
+            from agent_hub.llm import chat_completion_from_config
 
             for model_id in self.model_priority:
-                result = chat_completion(
+                result = chat_completion_from_config(
                     model_id=model_id,
                     messages=messages,
                     max_tokens=2048,

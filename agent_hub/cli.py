@@ -362,6 +362,66 @@ def agent_reload():
         console.print(f"  {valid_icon} {name}: {tasks_count} 个任务")
 
 
+@agent.command("models")
+@click.argument("name", required=False)
+def agent_models(name: str | None):
+    """查看已注册 Agent 声明的模型（只读）。
+
+    NAME: 可选，指定 Agent 名则只显示该 Agent 的模型详情。
+    """
+    agents_dict = _load_all_agents()
+
+    if not agents_dict:
+        console.print("[dim]未发现任何注册的 Agent[/dim]")
+        return
+
+    if name:
+        # 查看单个 Agent 的模型详情
+        if name not in agents_dict:
+            console.print(f"[red]✗ 未找到 Agent: {name}[/red]")
+            available = ", ".join(sorted(agents_dict.keys()))
+            console.print(f"[dim]可用: {available}[/dim]")
+            sys.exit(1)
+
+        manifest = agents_dict[name]
+        models = manifest.capabilities.models
+
+        table = Table(title=f"Agent '{name}' 模型配置")
+        table.add_column("模型", style="cyan bold")
+        for m in models:
+            table.add_row(m)
+
+        console.print(table)
+        if not models:
+            console.print("[dim]该 Agent 未在 agent.yaml 中声明 models 字段[/dim]")
+            console.print("[dim]模型可能通过环境变量隐式配置[/dim]")
+
+        console.print(Panel(
+            f"[dim]配置位置:[/dim] {manifest.source_path}/agent.yaml\n"
+            f"[dim]协议:[/dim] {manifest.protocol}",
+            title=f"Agent: {manifest.display_name}",
+            border_style="cyan",
+        ))
+    else:
+        # 一览所有 Agent 的模型
+        table = Table(title="所有 Agent 模型一览 (capabilities.models)")
+        table.add_column("Agent", style="cyan bold")
+        table.add_column("协议")
+        table.add_column("模型", style="green")
+
+        for agent_name, manifest in sorted(agents_dict.items()):
+            models_str = ", ".join(manifest.capabilities.models) if manifest.capabilities.models else "(未声明)"
+            table.add_row(
+                f"{_agent_icon(agent_name)} {agent_name}",
+                manifest.protocol,
+                models_str,
+            )
+
+        console.print(table)
+        console.print(f"\n[dim]共 {len(agents_dict)} 个 Agent | 模型声明在各项目的 agent.yaml 中[/dim]")
+        console.print("[dim]提示: Agent-hub 自身的模型用 'agent-hub models list' 管理[/dim]")
+
+
 @agent.command("validate")
 def agent_validate():
     """验证所有 agent.yaml 的合法性（只读校验）。"""
@@ -417,6 +477,281 @@ def agent_validate():
     else:
         console.print(f"\n[yellow]⚠ 部分 Agent 验证失败，请修正对应 agent.yaml[/yellow]")
         console.print("[dim]提示: 手动编辑项目目录下的 agent.yaml，然后运行 'agent-hub agent reload'[/dim]")
+
+
+# ── models 命令组 ────────────────────────────────────────────────────
+# Agent-hub 自身的模型配置管理，持久化到 models.yaml
+
+
+@main.group()
+def models():
+    """Agent-hub 模型配置管理（增删改查 + 优先级）。"""
+    pass
+
+
+@models.command("list")
+def models_list():
+    """列出 Agent-hub 已配置的所有模型。"""
+    from agent_hub.model_config import ModelConfigStore
+
+    store = ModelConfigStore()
+    entries = store.list_all()
+
+    if not entries:
+        console.print("[dim]未配置任何模型[/dim]")
+        console.print(f"[dim]使用 'agent-hub models add <name> --api-base <url> --api-key-env <VAR>' 添加模型[/dim]")
+        return
+
+    priority = store.get_priority()
+
+    table = Table(title="Agent-hub 模型配置")
+    table.add_column("优先级", style="dim", width=8)
+    table.add_column("模型名", style="cyan bold")
+    table.add_column("供应商")
+    table.add_column("API Base")
+    table.add_column("API Key")
+    table.add_column("默认")
+
+    for idx, entry in enumerate(entries):
+        rank = priority.index(entry.name) + 1 if entry.name in priority else idx + 1
+        key_display = "***" if entry.api_key and not entry.api_key.startswith("${") else (entry.api_key or "—")
+        default_icon = "⭐" if entry.default else ""
+        table.add_row(
+            str(rank),
+            entry.name,
+            entry.provider or "—",
+            entry.api_base or "—",
+            key_display,
+            default_icon,
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]共 {len(entries)} 个模型 | 配置文件: {store._config_path}[/dim]")
+    console.print("[dim]API Key 为明文时显示 ***，环境变量引用显示 ${VAR_NAME}[/dim]")
+
+
+@models.command("info")
+@click.argument("name")
+def models_info(name: str):
+    """查看指定模型的完整配置。"""
+    from agent_hub.model_config import ModelConfigStore
+
+    store = ModelConfigStore()
+    entry = store.get(name)
+
+    if not entry:
+        console.print(f"[red]✗ 未找到模型: {name}[/red]")
+        available = ", ".join(e.name for e in store.list_all())
+        if available:
+            console.print(f"[dim]已配置: {available}[/dim]")
+        else:
+            console.print("[dim]使用 'agent-hub models add' 添加模型[/dim]")
+        sys.exit(1)
+
+    console.print(Panel(
+        f"[bold cyan]{entry.name}[/bold cyan]\n\n"
+        f"[dim]供应商:[/dim] {entry.provider or '—'}\n"
+        f"[dim]API Base:[/dim] {entry.api_base or '—'}\n"
+        f"[dim]API Key:[/dim] {'***' if entry.api_key else '—'} "
+        f"{'(' + entry.api_key + ')' if entry.api_key.startswith('${') else ''}\n"
+        f"[dim]支持的模型:[/dim] {', '.join(entry.models) if entry.models else entry.name}\n"
+        f"[dim]默认模型:[/dim] {'⭐ 是' if entry.default else '否'}\n\n"
+        f"[dim]解析后的 API Key:[/dim] "
+        f"{'已设置' if entry.resolved_api_key else '⚠ 未设置'}",
+        title=f"模型: {name}",
+        border_style="cyan",
+    ))
+
+
+@models.command("add")
+@click.argument("name")
+@click.option("--api-base", required=True, help="API endpoint URL")
+@click.option("--api-key", default=None, help="API Key（明文）")
+@click.option("--api-key-env", default=None, help="API Key 环境变量名（推荐，如 DEEPSEEK_API_KEY）")
+@click.option("--provider", default=None, help="模型供应商名（deepseek, anthropic, openai...）")
+@click.option("--set-default", is_flag=True, help="设为默认模型（优先级最高）")
+def models_add(
+    name: str,
+    api_base: str,
+    api_key: str | None,
+    api_key_env: str | None,
+    provider: str | None,
+    set_default: bool,
+):
+    """添加新的 LLM 模型配置。
+
+    NAME: 模型标识名（如 deepseek-v4-pro）
+    """
+    from agent_hub.model_config import ModelConfigStore, ModelEntry
+
+    if api_key and api_key_env:
+        console.print("[red]✗ --api-key 和 --api-key-env 不能同时指定[/red]")
+        sys.exit(1)
+    if not api_key and not api_key_env:
+        console.print("[red]✗ 必须指定 --api-key 或 --api-key-env[/red]")
+        sys.exit(1)
+
+    store = ModelConfigStore()
+    entry = ModelEntry(
+        name=name,
+        provider=provider or _guess_provider(name),
+        api_base=api_base,
+        api_key=api_key or f"${{{api_key_env}}}",
+        models=[name],
+        default=set_default,
+    )
+
+    try:
+        store.add(entry)
+        console.print(f"[green]✅ 已添加模型: {name}[/green]")
+        console.print(f"   API Base: {api_base}")
+        console.print(f"   API Key:  {'${' + api_key_env + '}' if api_key_env else '***'}")
+        if set_default:
+            console.print(f"   ⭐ 已设为默认模型")
+        console.print(f"\n[dim]配置文件: {store._config_path}[/dim]")
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        sys.exit(1)
+
+
+@models.command("remove")
+@click.argument("name")
+@click.option("--yes", "-y", is_flag=True, help="跳过确认")
+def models_remove(name: str, yes: bool):
+    """删除指定的模型配置。
+
+    NAME: 要删除的模型名
+    """
+    from agent_hub.model_config import ModelConfigStore
+
+    store = ModelConfigStore()
+    entry = store.get(name)
+    if not entry:
+        console.print(f"[red]✗ 未找到模型: {name}[/red]")
+        sys.exit(1)
+
+    if not yes:
+        console.print(f"[yellow]⚠ 确认删除模型 '{name}'？[/yellow]")
+        if not click.confirm("删除后无法恢复，是否继续？"):
+            console.print("[dim]已取消[/dim]")
+            return
+
+    store.remove(name)
+    console.print(f"[green]✅ 已删除模型: {name}[/green]")
+
+
+@models.command("update")
+@click.argument("name")
+@click.option("--api-key", default=None, help="新的 API Key（明文）")
+@click.option("--api-key-env", default=None, help="新的 API Key 环境变量名")
+@click.option("--api-base", default=None, help="新的 API Base URL")
+@click.option("--provider", default=None, help="新的供应商名")
+@click.option("--set-default", is_flag=True, help="设为默认模型")
+def models_update(
+    name: str,
+    api_key: str | None,
+    api_key_env: str | None,
+    api_base: str | None,
+    provider: str | None,
+    set_default: bool,
+):
+    """更新指定模型的配置。
+
+    NAME: 要更新的模型名
+    """
+    from agent_hub.model_config import ModelConfigStore
+
+    if api_key and api_key_env:
+        console.print("[red]✗ --api-key 和 --api-key-env 不能同时指定[/red]")
+        sys.exit(1)
+
+    store = ModelConfigStore()
+
+    kwargs: dict = {}
+    if api_key:
+        kwargs["api_key"] = api_key
+    if api_key_env:
+        kwargs["api_key"] = f"${{{api_key_env}}}"
+    if api_base:
+        kwargs["api_base"] = api_base
+    if provider:
+        kwargs["provider"] = provider
+    if set_default:
+        kwargs["default"] = True
+
+    if not kwargs:
+        console.print("[yellow]⚠ 未指定要更新的字段[/yellow]")
+        console.print("[dim]示例: agent-hub models update gpt-4o --api-key-env OPENAI_API_KEY[/dim]")
+        return
+
+    try:
+        entry = store.update(name, **kwargs)
+        console.print(f"[green]✅ 已更新模型: {name}[/green]")
+        if set_default:
+            console.print(f"   ⭐ 已设为默认模型")
+        console.print(f"\n[dim]配置文件: {store._config_path}[/dim]")
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        sys.exit(1)
+
+
+@models.command("priority")
+@click.option("--set", "-s", "set_priority", default=None, help="设置优先级（逗号分隔，如 deepseek,claude）")
+def models_priority(set_priority: str | None):
+    """查看或设置模型优先级。
+
+    不传 --set 则显示当前优先级。
+    """
+    from agent_hub.model_config import ModelConfigStore
+
+    store = ModelConfigStore()
+    priority = store.get_priority()
+
+    if set_priority:
+        names = [n.strip() for n in set_priority.split(",") if n.strip()]
+        try:
+            store.set_priority(names)
+            console.print(f"[green]✅ 模型优先级已更新:[/green]")
+        except ValueError as e:
+            console.print(f"[red]✗ {e}[/red]")
+            sys.exit(1)
+    else:
+        console.print("[bold]当前模型优先级:[/bold]")
+
+    priority = store.get_priority()
+    for idx, name in enumerate(priority):
+        entry = store.get(name)
+        provider = f" ({entry.provider})" if entry and entry.provider else ""
+        default_mark = " ⭐" if entry and entry.default else ""
+        console.print(f"  {idx + 1}. [cyan]{name}[/cyan]{provider}{default_mark}")
+
+    if not priority:
+        console.print("[dim]  未配置任何模型[/dim]")
+
+    console.print(f"\n[dim]配置文件: {store._config_path}[/dim]")
+    console.print("[dim]提示: 未包含在优先级列表中的模型不会被自动使用[/dim]")
+
+
+def _guess_provider(name: str) -> str:
+    """根据模型名猜测供应商。"""
+    name_lower = name.lower()
+    if "deepseek" in name_lower:
+        return "deepseek"
+    if "claude" in name_lower or "anthropic" in name_lower:
+        return "anthropic"
+    if "gpt" in name_lower or "openai" in name_lower:
+        return "openai"
+    if "qwen" in name_lower:
+        return "qwen"
+    if "glm" in name_lower:
+        return "glm"
+    if "doubao" in name_lower:
+        return "doubao"
+    if "moonshot" in name_lower or "kimi" in name_lower:
+        return "moonshot"
+    if "ollama" in name_lower:
+        return "ollama"
+    return "unknown"
 
 
 # ── run ──────────────────────────────────────────────────────────────
