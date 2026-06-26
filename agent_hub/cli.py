@@ -132,7 +132,10 @@ def start(agents: str | None):
             sys.exit(1)
 
     async def _start():
+        from agent_hub.pid_store import PidFileStore
+
         bridge = CLIBridge()
+        pid_store = PidFileStore()
 
         console.print("\n[bold cyan]🚀 启动 Agent...[/bold cyan]")
         manifest_list = list(agents_dict.values())
@@ -140,6 +143,11 @@ def start(agents: str | None):
 
         success_count = sum(1 for r in results.values() if r.status == "running")
         fail_count = len(results) - success_count
+
+        # 持久化 PID 到文件（使 agent-hub stop 能定位进程）
+        for name, info in results.items():
+            if info.is_running:
+                pid_store.save(name, info.pid, protocol=info.manifest.protocol if info.manifest else "cli")
 
         table = Table(title="Agent 启动状态")
         table.add_column("Agent", style="cyan")
@@ -155,6 +163,7 @@ def start(agents: str | None):
 
         if success_count > 0:
             console.print(f"\n[green]✅ {success_count} 个 Agent 已启动[/green]")
+            console.print(f"[dim]PID 已保存到: {pid_store._store_path}[/dim]")
             console.print("[dim]按 Ctrl+C 停止所有 Agent[/dim]")
 
             # 保持运行直到用户中断
@@ -170,6 +179,9 @@ def start(agents: str | None):
             except KeyboardInterrupt:
                 console.print("\n[yellow]⏸ 正在停止所有 Agent...[/yellow]")
                 await bridge.stop_all()
+                # 清理 PID 文件
+                for name in results:
+                    pid_store.remove(name)
                 console.print("[green]✅ 所有 Agent 已停止[/green]")
 
     asyncio.run(_start())
@@ -177,15 +189,25 @@ def start(agents: str | None):
 
 @main.command()
 def stop():
-    """停止所有 Agent。"""
+    """停止通过 agent-hub start 启动的所有 Agent 进程。"""
     async def _stop():
-        bridge = CLIBridge()
-        agents_dict = _load_all_agents()
+        from agent_hub.pid_store import PidFileStore
 
-        # 尝试停止所有已知 Agent
-        console.print("[yellow]⏸ 正在停止所有 Agent...[/yellow]")
-        await bridge.stop_all()
-        console.print("[green]✅ 所有 Agent 已停止[/green]")
+        pid_store = PidFileStore()
+        existing = pid_store.load_all()
+
+        if not existing:
+            console.print("[dim]没有持久化的 Agent 进程记录[/dim]")
+            console.print("[dim]提示: agent-hub stop 只能停止通过 agent-hub start 启动的进程[/dim]")
+            return
+
+        console.print(f"[dim]发现 {len(existing)} 个 Agent 进程记录[/dim]")
+        for name, proc in existing.items():
+            console.print(f"  • {name} (pid={proc.pid}, protocol={proc.protocol})")
+
+        console.print("\n[yellow]⏸ 正在停止所有 Agent...[/yellow]")
+        count = await pid_store.stop_all()
+        console.print(f"[green]✅ 已停止 {count} 个 Agent 进程[/green]")
 
     asyncio.run(_stop())
 

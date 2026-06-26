@@ -23,6 +23,10 @@ env/
 .coverage
 htmlcov/
 
+# Agent Hub runtime
+.agent_hub/
+models.yaml
+
 # OS
 Thumbs.db
 .DS_Store
