@@ -481,3 +481,223 @@ def _join_vertically(renderables: list[RenderableType]) -> RenderableType:
 
     # 多面板：2 列网格
     return Columns(renderables, equal=False, expand=False)
+
+
+# ── 健康监控仪表盘 ────────────────────────────────────────────────
+
+
+class HealthDashboard:
+    """Agent 健康监控仪表盘 — 用于 agent-hub start。
+
+    与 AgentDashboard（用于 agent-hub run 的任务执行可视化）不同，
+    HealthDashboard 专注于 Agent 进程的健康状态监控：
+    - 每个 Agent 的状态面板（🟢/🔴/🟡 + PID + 运行时间）
+    - 健康检查事件日志（最近 20 条）
+    - 按 Ctrl+C 优雅退出
+
+    使用方式：
+        dash = HealthDashboard(console, agents)
+        with dash.run():
+            dash.update_agent("omniagent", "running", pid=12345, uptime=12.5)
+            dash.log_event("Health check cycle complete")
+            dash.refresh()
+    """
+
+    MAX_LOG_ENTRIES = 20
+
+    def __init__(
+        self,
+        console: Console,
+        agents: dict[str, Any],  # dict[str, AgentManifest]
+        *,
+        title: str = "Agent Hub — Health Monitor",
+        refresh_per_second: int = 4,
+    ) -> None:
+        self.console = console
+        self.agent_names = list(agents.keys()) if agents else []
+        self.title = title
+        self.refresh_per_second = refresh_per_second
+
+        # 每个 Agent 的健康状态
+        self._agent_health: dict[str, dict] = {
+            name: {"status": "pending", "pid": 0, "uptime": 0.0, "last_check": ""}
+            for name in self.agent_names
+        }
+
+        # 健康事件日志
+        self._health_log: list[str] = []
+
+        # Rich Live 实例
+        self._live: Live | None = None
+
+    # ── 更新 ───────────────────────────────────────────────────────
+
+    def update_agent(
+        self,
+        name: str,
+        status: str,
+        pid: int = 0,
+        uptime: float = 0.0,
+    ) -> None:
+        """更新单个 Agent 的实时状态。
+
+        Args:
+            name: Agent 名称
+            status: running | starting | stopped | failed | pending
+            pid: 进程 PID
+            uptime: 运行时间（秒）
+        """
+        if name in self._agent_health:
+            entry = self._agent_health[name]
+            entry.update(
+                status=status,
+                pid=pid,
+                uptime=uptime,
+                last_check=time.strftime("%H:%M:%S"),
+            )
+
+    def log_event(self, message: str) -> None:
+        """追加一条带时间戳的健康事件。
+
+        Args:
+            message: 事件描述（如 "omniagent health check FAILED"）
+        """
+        t = time.strftime("%H:%M:%S")
+        self._health_log.append(f"[dim]{t}[/dim] {message}")
+        if len(self._health_log) > self.MAX_LOG_ENTRIES:
+            self._health_log = self._health_log[-self.MAX_LOG_ENTRIES:]
+
+    # ── Life ────────────────────────────────────────────────────────
+
+    def run(self) -> Live:
+        """创建 Rich Live 上下文管理器。"""
+        self._live = Live(
+            self._build_layout(),
+            console=self.console,
+            refresh_per_second=self.refresh_per_second,
+            transient=False,
+        )
+        return self._live
+
+    def refresh(self) -> None:
+        """手动刷新仪表盘。"""
+        if self._live:
+            self._live.update(self._build_layout())
+
+    # ── 布局 ────────────────────────────────────────────────────────
+
+    def _build_layout(self) -> Layout:
+        """构建 HealthDashboard 布局。
+
+        布局结构:
+        ┌────────────────────────────────────────┐
+        │  Header: Agent Hub — Health Monitor     │
+        ├──────────────────┬─────────────────────┤
+        │  Agent Status     │  Health Events      │
+        │  (2/3 width)     │  (1/3 width)        │
+        │                  │                    │
+        │  🟢 omniagent    │  12:00:01 Started  │
+        │    running 12s   │  12:00:05 Check OK │
+        │  🟡 resume-sync  │  12:00:10 Check OK │
+        │    starting      │                    │
+        │  ⚫ smartbench   │                    │
+        │    stopped       │                    │
+        └──────────────────┴─────────────────────┘
+        """
+        root = Layout()
+        root.split(
+            Layout(name="header", size=1),
+            Layout(name="body"),
+        )
+
+        # Header
+        root["header"].update(
+            Panel(
+                Align.center(f"[bold white]{self.title}[/] — 按 [bold yellow]Ctrl+C[/] 停止"),
+                style="bold blue",
+            )
+        )
+
+        # Body: Agent 状态（左）+ 健康事件日志（右）
+        body = Layout()
+        body.split_row(
+            Layout(name="agent_status", ratio=2),
+            Layout(name="health_log", ratio=1),
+        )
+
+        # ── Agent 状态面板 ──
+        agent_panels: list[RenderableType] = []
+        for name in self.agent_names:
+            h = self._agent_health.get(name, {})
+            status = h.get("status", "pending")
+
+            # 状态图标和颜色
+            icon_map = {
+                "running": "🟢",
+                "starting": "🟡",
+                "stopped": "⚫",
+                "failed": "🔴",
+                "pending": "⬡",
+            }
+            color_map = {
+                "running": "green",
+                "starting": "yellow",
+                "stopped": "dim",
+                "failed": "red",
+                "pending": "dim",
+            }
+            icon = icon_map.get(status, "❓")
+            color = color_map.get(status, "white")
+
+            # 构建内容行
+            lines = [f"{icon} [bold {color}]{status}[/bold {color}]"]
+
+            if h.get("pid"):
+                lines.append(f"   PID: {h['pid']}")
+            if status == "running" and h.get("uptime", 0) > 0:
+                uptime = h["uptime"]
+                if uptime >= 3600:
+                    lines.append(f"   Uptime: {uptime / 3600:.1f}h")
+                elif uptime >= 60:
+                    lines.append(f"   Uptime: {uptime / 60:.1f}m")
+                else:
+                    lines.append(f"   Uptime: {uptime:.0f}s")
+            if h.get("last_check"):
+                lines.append(f"   Last check: {h['last_check']}")
+
+            agent_icon = _agent_icon(name)
+            panel = Panel(
+                Text("\n".join(lines)),
+                title=f"{agent_icon} {name}",
+                border_style=color,
+                width=45,
+            )
+            agent_panels.append(panel)
+
+        if not agent_panels:
+            agent_panels.append(Text("  (无已注册的 Agent)", style="dim"))
+
+        body["agent_status"].update(
+            Panel(
+                _join_vertically(agent_panels),
+                title="🤖 Agent Status",
+                border_style="cyan",
+            )
+        )
+
+        # ── 健康事件日志 ──
+        if self._health_log:
+            log_text = Text("\n".join(self._health_log[-15:]))
+        else:
+            log_text = Text("  (等待健康检查...)", style="dim")
+
+        body["health_log"].update(
+            Panel(
+                log_text,
+                title="📡 Health Events",
+                border_style="yellow",
+            )
+        )
+
+        root["body"] = body
+        return root

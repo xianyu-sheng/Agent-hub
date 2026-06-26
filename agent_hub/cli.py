@@ -132,57 +132,81 @@ def start(agents: str | None):
             sys.exit(1)
 
     async def _start():
+        from agent_hub.dashboard import HealthDashboard
         from agent_hub.pid_store import PidFileStore
 
         bridge = CLIBridge()
         pid_store = PidFileStore()
 
-        console.print("\n[bold cyan]🚀 启动 Agent...[/bold cyan]")
-        manifest_list = list(agents_dict.values())
-        results = await bridge.start_all(manifest_list)
+        # 跳过 internal 协议的 Agent（Agent-hub 自身不需要作为进程启动）
+        external_agents = {
+            name: m for name, m in agents_dict.items()
+            if m.protocol != "internal"
+        }
 
-        success_count = sum(1 for r in results.values() if r.status == "running")
-        fail_count = len(results) - success_count
+        if not external_agents:
+            console.print("[yellow]⚠ 没有需要通过子进程启动的外部 Agent[/yellow]")
+            console.print("[dim]internal 协议的 Agent（如 agent-hub）在进程内运行，无需额外启动[/dim]")
+            return
 
-        # 持久化 PID 到文件（使 agent-hub stop 能定位进程）
-        for name, info in results.items():
-            if info.is_running:
-                pid_store.save(name, info.pid, protocol=info.manifest.protocol if info.manifest else "cli")
+        # 创建健康监控仪表盘
+        dash = HealthDashboard(console, external_agents, title="Agent Hub — Health Monitor")
 
-        table = Table(title="Agent 启动状态")
-        table.add_column("Agent", style="cyan")
-        table.add_column("状态")
-        table.add_column("PID")
+        with dash.run():
+            dash.log_event("正在启动 Agent...")
+            dash.refresh()
 
-        for name, info in results.items():
-            status_icon = "🟢" if info.is_running else "🔴"
-            pid_str = str(info.pid) if info.pid else "—"
-            table.add_row(name, f"{status_icon} {info.status}", pid_str)
+            manifest_list = list(external_agents.values())
+            results = await bridge.start_all(manifest_list)
 
-        console.print(table)
+            success_count = sum(1 for r in results.values() if r.status == "running")
 
-        if success_count > 0:
-            console.print(f"\n[green]✅ {success_count} 个 Agent 已启动[/green]")
-            console.print(f"[dim]PID 已保存到: {pid_store._store_path}[/dim]")
-            console.print("[dim]按 Ctrl+C 停止所有 Agent[/dim]")
+            # 更新仪表盘 + 持久化 PID
+            for name, info in results.items():
+                dash.update_agent(name, info.status, info.pid)
+                if info.is_running:
+                    pid_store.save(
+                        name, info.pid,
+                        protocol=info.manifest.protocol if info.manifest else "cli",
+                    )
+                dash.log_event(
+                    f"{name}: {'🟢 started' if info.is_running else '🔴 failed'} "
+                    f"(pid={info.pid})"
+                )
 
-            # 保持运行直到用户中断
+            dash.log_event(f"启动完成: {success_count}/{len(results)} 个 Agent 运行中")
+            dash.refresh()
+
+            if success_count == 0:
+                dash.log_event("警告: 所有 Agent 启动失败")
+
+            # 健康检查循环（在仪表盘内运行）
             try:
                 while True:
-                    # 健康检查
                     for name in list(results.keys()):
                         healthy = await bridge.health_check(name)
-                        if not healthy and results[name].status == "running":
-                            console.print(f"[yellow]⚠ {name} 已停止响应[/yellow]")
+                        info = bridge.registry.get(name)
+                        status = "running" if healthy else "failed"
+                        uptime = info.uptime_seconds if info else 0.0
 
+                        dash.update_agent(name, status, info.pid if info else 0, uptime)
+
+                        if not healthy and results.get(name) and results[name].status == "running":
+                            dash.log_event(f"⚠ {name} 健康检查失败")
+
+                    dash.log_event("Health check ✓")
+                    dash.refresh()
                     await asyncio.sleep(5)
-            except KeyboardInterrupt:
-                console.print("\n[yellow]⏸ 正在停止所有 Agent...[/yellow]")
+
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                dash.log_event("⏸ 正在停止所有 Agent...")
+                dash.refresh()
                 await bridge.stop_all()
                 # 清理 PID 文件
                 for name in results:
                     pid_store.remove(name)
-                console.print("[green]✅ 所有 Agent 已停止[/green]")
+                dash.log_event("✅ 所有 Agent 已停止")
+                dash.refresh()
 
     asyncio.run(_start())
 
