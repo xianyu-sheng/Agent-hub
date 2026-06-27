@@ -219,6 +219,10 @@ model_priority:
                 f"模型 '{entry.name}' 已存在。使用 'agent-hub models update {entry.name} ...' 更新，"
                 f"或 'agent-hub models remove {entry.name}' 先删除。"
             )
+        # 若设为默认，清除其他条目的 default 标记（只有一个默认）
+        if entry.default:
+            for e in self._models.values():
+                e.default = False
         self._models[entry.name] = entry
         if entry.name not in self._priority:
             if entry.default:

@@ -229,9 +229,8 @@ def _print_welcome_banner() -> None:
     if not model_entries:
         tip = (
             "[yellow]💡 检测到未配置模型，请先添加:[/yellow]\n"
-            "   models add [cyan]deepseek-v4-pro[/cyan] "
-            "--api-base [green]https://api.deepseek.com[/green] "
-            "--api-key-env [green]DEEPSEEK_API_KEY[/green]"
+            "   输入 [bold]models add[/bold] 进入引导式配置，"
+            "或 [bold]models add deepseek-v4-pro -k DEEPSEEK_API_KEY[/bold]"
         )
     elif not agents_dict or len(agents_dict) <= 1:
         tip = (
@@ -264,7 +263,8 @@ def _repl_help() -> None:
     commands = [
         ("[bold cyan]模型配置[/bold cyan]", ""),
         ("  models list", "列出已配置的 LLM 模型"),
-        ("  models add <name> --api-base <url> --api-key-env <VAR>", "添加模型（支持 --provider, --set-default）"),
+        ("  models add", "交互式引导添加模型（只需模型名 + API Key）"),
+        ("  models add <name> -k <KEY>", "快速添加（自动识别供应商和 API 地址）"),
         ("  models remove <name>", "删除模型"),
         ("  models info <name>", "模型详情"),
         ("  models priority [--set a,b,c]", "查看/设置模型优先级"),
@@ -749,6 +749,57 @@ def agent_validate():
         console.print("[dim]提示: 手动编辑项目目录下的 agent.yaml，然后运行 'agent-hub agent reload'[/dim]")
 
 
+# ── 模型自动识别映射 ──────────────────────────────────────────────
+# 根据模型名自动推断供应商和 API Base，用户只需提供模型名 + API Key
+
+_MODEL_DETECT_TABLE: dict[str, tuple[str, str]] = {
+    "deepseek": ("deepseek", "https://api.deepseek.com"),
+    "claude": ("anthropic", "https://api.anthropic.com"),
+    "anthropic": ("anthropic", "https://api.anthropic.com"),
+    "gpt": ("openai", "https://api.openai.com"),
+    "openai": ("openai", "https://api.openai.com"),
+    "qwen": ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    "glm": ("glm", "https://open.bigmodel.cn/api/paas/v4"),
+    "doubao": ("doubao", "https://ark.cn-beijing.volces.com/api/v3"),
+    "moonshot": ("moonshot", "https://api.moonshot.cn/v1"),
+    "kimi": ("moonshot", "https://api.moonshot.cn/v1"),
+    "ollama": ("ollama", "http://localhost:11434"),
+    "gemini": ("google", "https://generativelanguage.googleapis.com/v1beta"),
+}
+
+
+def _detect_model_config(name: str) -> tuple[str, str]:
+    """根据模型名自动推断 (provider, api_base)。
+
+    >>> _detect_model_config("deepseek-v4-pro")
+    ("deepseek", "https://api.deepseek.com")
+    >>> _detect_model_config("gpt-4o")
+    ("openai", "https://api.openai.com")
+    """
+    name_lower = name.lower()
+    for keyword, (provider, api_base) in _MODEL_DETECT_TABLE.items():
+        if keyword in name_lower:
+            return provider, api_base
+    return "unknown", ""
+
+
+def _smart_api_key(value: str) -> str:
+    """智能识别 API Key 格式。
+
+    - 纯大写+下划线 → 环境变量引用 ${VAR}
+    - 包含 $ → 已是引用格式，原样返回
+    - 其他 → 明文 key
+    """
+    if not value:
+        return value
+    if "$" in value:
+        return value  # 已是 ${VAR} 格式
+    # 纯大写 + 下划线 → 环境变量引用
+    if value.isupper() and "_" in value and not value.startswith("SK-"):
+        return f"${{{value}}}"
+    return value
+
+
 # ── models 命令组 ────────────────────────────────────────────────────
 # Agent-hub 自身的模型配置管理，持久化到 models.yaml
 
@@ -769,7 +820,7 @@ def models_list():
 
     if not entries:
         console.print("[dim]未配置任何模型[/dim]")
-        console.print(f"[dim]使用 'agent-hub models add <name> --api-base <url> --api-key-env <VAR>' 添加模型[/dim]")
+        console.print(f"[dim]输入 'models add' 进入引导式添加[/dim]")
         return
 
     priority = store.get_priority()
@@ -815,7 +866,7 @@ def models_info(name: str):
         if available:
             console.print(f"[dim]已配置: {available}[/dim]")
         else:
-            console.print("[dim]使用 'agent-hub models add' 添加模型[/dim]")
+            console.print("[dim]输入 'models add' 添加模型[/dim]")
         sys.exit(1)
 
     console.print(Panel(
@@ -834,54 +885,120 @@ def models_info(name: str):
 
 
 @models.command("add")
-@click.argument("name")
-@click.option("--api-base", required=True, help="API endpoint URL")
-@click.option("--api-key", default=None, help="API Key（明文）")
-@click.option("--api-key-env", default=None, help="API Key 环境变量名（推荐，如 DEEPSEEK_API_KEY）")
-@click.option("--provider", default=None, help="模型供应商名（deepseek, anthropic, openai...）")
-@click.option("--set-default", is_flag=True, help="设为默认模型（优先级最高）")
+@click.argument("name", required=False)
+@click.option("--api-key", "-k", default=None, help="API Key 或环境变量名")
+@click.option("--api-base", default=None, help="API Base URL（可选，自动推断）")
+@click.option("--provider", default=None, help="供应商名（可选，自动推断）")
+@click.option("--set-default", is_flag=True, help="设为默认模型")
 def models_add(
-    name: str,
-    api_base: str,
+    name: str | None,
     api_key: str | None,
-    api_key_env: str | None,
+    api_base: str | None,
     provider: str | None,
     set_default: bool,
 ):
-    """添加新的 LLM 模型配置。
+    """添加 LLM 模型配置 — 交互式引导，只需模型名 + API Key。
 
-    NAME: 模型标识名（如 deepseek-v4-pro）
+    \b
+    交互模式（推荐）：
+      models add              ← 引导式输入
+
+    \b
+    命令行模式：
+      models add deepseek-v4-pro -k DEEPSEEK_API_KEY
+      models add gpt-4o -k sk-xxxx --set-default
     """
     from agent_hub.model_config import ModelConfigStore, ModelEntry
+    from rich.prompt import Prompt as RichPrompt
 
-    if api_key and api_key_env:
-        console.print("[red]✗ --api-key 和 --api-key-env 不能同时指定[/red]")
-        sys.exit(1)
-    if not api_key and not api_key_env:
-        console.print("[red]✗ 必须指定 --api-key 或 --api-key-env[/red]")
-        sys.exit(1)
+    # ── 交互模式：没有提供足够参数时进入引导 ──
+    if not name or not api_key:
+        console.print()
+        console.rule("[bold cyan]📋 添加新的 LLM 模型[/bold cyan]")
+        console.print()
 
+        # Step 1: 模型名称
+        if not name:
+            console.print("[bold]1/2  模型名称[/bold]")
+            console.print("[dim]输入模型标识名，系统会自动识别供应商和 API 地址[/dim]")
+            console.print("[dim]常见: deepseek-v4-pro | gpt-4o | claude-sonnet-4-6 | qwen-plus[/dim]")
+
+            # 列出已有的模型作为参考
+            store = ModelConfigStore()
+            existing = store.list_all()
+            if existing:
+                existing_names = ", ".join(e.name for e in existing)
+                console.print(f"[dim]已配置: {existing_names}[/dim]")
+
+            name = RichPrompt.ask("模型名称")
+            if not name or not name.strip():
+                console.print("[red]✗ 模型名称不能为空[/red]")
+                return
+            name = name.strip()
+
+        # 自动检测供应商和 API Base
+        detected_provider, detected_base = _detect_model_config(name)
+        if detected_provider != "unknown":
+            console.print(f"  [dim]自动识别: [green]{detected_provider}[/green] → {detected_base}[/dim]")
+
+        # Step 2: API Key
+        if not api_key:
+            console.print()
+            console.print("[bold]2/2  API Key[/bold]")
+            console.print("[dim]支持两种方式：[/dim]")
+            console.print("[dim]  1. 环境变量名 → 自动引用（推荐）  如: DEEPSEEK_API_KEY[/dim]")
+            console.print("[dim]  2. 直接粘贴 Key → 明文存储         如: sk-xxxxxxxx[/dim]")
+
+            api_key = RichPrompt.ask("API Key")
+            if not api_key or not api_key.strip():
+                console.print("[red]✗ API Key 不能为空[/red]")
+                return
+            api_key = api_key.strip()
+
+        console.print()
+
+    # ── 处理 API Key ──
+    final_api_key = _smart_api_key(api_key)
+
+    # ── 自动检测未指定的参数 ──
+    final_provider = provider or _detect_model_config(name)[0]
+    final_api_base = api_base or _detect_model_config(name)[1]
+
+    # 验证：如果 api_base 为空且无法自动检测
+    if not final_api_base:
+        console.print(f"[yellow]⚠ 无法自动识别 '{name}' 的 API Base[/yellow]")
+        final_api_base = RichPrompt.ask("请手动输入 API Base URL")
+        if not final_api_base:
+            console.print("[red]✗ API Base 不能为空[/red]")
+            return
+
+    # ── 持久化 ──
     store = ModelConfigStore()
     entry = ModelEntry(
         name=name,
-        provider=provider or _guess_provider(name),
-        api_base=api_base,
-        api_key=api_key or f"${{{api_key_env}}}",
+        provider=final_provider or "unknown",
+        api_base=final_api_base,
+        api_key=final_api_key,
         models=[name],
         default=set_default,
     )
 
     try:
         store.add(entry)
-        console.print(f"[green]✅ 已添加模型: {name}[/green]")
-        console.print(f"   API Base: {api_base}")
-        console.print(f"   API Key:  {'${' + api_key_env + '}' if api_key_env else '***'}")
-        if set_default:
-            console.print(f"   ⭐ 已设为默认模型")
-        console.print(f"\n[dim]配置文件: {store._config_path}[/dim]")
     except ValueError as e:
         console.print(f"[red]✗ {e}[/red]")
-        sys.exit(1)
+        return
+
+    # ── 成功反馈 ──
+    key_display = final_api_key if final_api_key.startswith("${") else "***"
+    console.print(f"[green]✅ 已添加模型: [bold]{name}[/bold][/green]")
+    console.print(f"   供应商:  {final_provider or '—'}")
+    console.print(f"   API:     {final_api_base}")
+    console.print(f"   Key:     {key_display}")
+    if set_default:
+        console.print(f"   ⭐ 已设为默认模型")
+    console.print(f"\n[dim]配置文件: {store._config_path}[/dim]")
+    console.print("[dim]已就绪！输入 start 启动系统，或 run \"任务\" 直接执行[/dim]")
 
 
 @models.command("remove")
@@ -1000,28 +1117,6 @@ def models_priority(set_priority: str | None):
 
     console.print(f"\n[dim]配置文件: {store._config_path}[/dim]")
     console.print("[dim]提示: 未包含在优先级列表中的模型不会被自动使用[/dim]")
-
-
-def _guess_provider(name: str) -> str:
-    """根据模型名猜测供应商。"""
-    name_lower = name.lower()
-    if "deepseek" in name_lower:
-        return "deepseek"
-    if "claude" in name_lower or "anthropic" in name_lower:
-        return "anthropic"
-    if "gpt" in name_lower or "openai" in name_lower:
-        return "openai"
-    if "qwen" in name_lower:
-        return "qwen"
-    if "glm" in name_lower:
-        return "glm"
-    if "doubao" in name_lower:
-        return "doubao"
-    if "moonshot" in name_lower or "kimi" in name_lower:
-        return "moonshot"
-    if "ollama" in name_lower:
-        return "ollama"
-    return "unknown"
 
 
 # ── run ──────────────────────────────────────────────────────────────
