@@ -176,7 +176,7 @@ class IntentRouter:
         if not agents:
             return RoutePlan(
                 tasks=[],
-                analysis="没有可用的 Agent。请先注册 Agent (agent-hub agent register <path>)。",
+                analysis="未发现任何 Agent。请先注册: agent register <项目路径>",
             )
 
         # 构建 Agent 描述 → system prompt
@@ -214,7 +214,11 @@ class IntentRouter:
                 return self._rule_based_route(user_input, agents)
             return RoutePlan(
                 tasks=[],
-                analysis=f"意图路由失败: {e}",
+                analysis=(
+                    "LLM 路由失败。请检查模型配置:\n"
+                    "  models add deepseek-v4-pro -k DEEPSEEK_API_KEY\n"
+                    f"  错误详情: {e}"
+                ),
             )
 
     # ── LLM 交互 ─────────────────────────────────────────────────
@@ -224,6 +228,7 @@ class IntentRouter:
         from agent_hub.llm import chat_completion_from_config
 
         last_error = None
+        tried_models: list[str] = []
         for model_id in self.model_priority:
             try:
                 result = await chat_completion_from_config(
@@ -234,12 +239,19 @@ class IntentRouter:
                 )
                 if result and result.strip():
                     return result
+                else:
+                    tried_models.append(model_id)
             except Exception as e:
                 last_error = e
-                logger.debug("模型 %s 路由失败: %s", model_id, e)
+                tried_models.append(f"{model_id}({e})")
                 continue
 
-        raise RuntimeError(f"所有模型路由失败，最后错误: {last_error}")
+        if not tried_models:
+            tried_models = list(self.model_priority)
+        raise RuntimeError(
+            f"所有模型 ({', '.join(tried_models)}) 调用失败。"
+            f"请检查: 1) models add 配置模型 2) API Key 已设置 3) 网络连接"
+        )
 
     @staticmethod
     def _parse_llm_output(

@@ -324,6 +324,52 @@ model_priority:
         return entries[0] if entries else None
 
 
+# ── 系统就绪检查 ──────────────────────────────────────────────────
+
+
+def check_system_ready() -> tuple[bool, str]:
+    """检查系统是否就绪（模型已配置 + API Key 可用）。
+
+    返回 (is_ready, guidance_message)。
+    供 REPL、run 命令、启动横幅使用，统一提供用户友好提示。
+
+    Returns:
+        (True, "") — 就绪
+        (False, "请先...") — 未就绪 + 操作指引
+    """
+    store = ModelConfigStore()
+    entries = store.list_all()
+
+    # 1. 没有配置模型
+    if not entries:
+        return False, (
+            "尚未配置 LLM 模型。请运行:\n"
+            "  [bold]models add[/bold] 进入引导式配置\n"
+            "  或 [bold]models add deepseek-v4-pro -k DEEPSEEK_API_KEY[/bold]"
+        )
+
+    # 2. 有模型但 API Key 均不可用
+    resolvable = [e for e in entries if e.resolved_api_key]
+    if not resolvable:
+        unset_names = ", ".join(e.name for e in entries)
+        example = entries[0]
+        env_hint = ""
+        if example.api_key.startswith("${"):
+            var_name = example.api_key.strip("${}")
+            env_hint = (
+                f"\n  设置环境变量: [bold]set {var_name}=sk-xxxx[/bold]\n"
+                f"  或更新模型: [bold]models update {example.name} -k sk-xxxx[/bold]"
+            )
+        return False, (
+            f"已配置 {len(entries)} 个模型，但 API Key 均未设置:\n"
+            f"  {unset_names}{env_hint}"
+        )
+
+    # 3. 就绪
+    ready_names = ", ".join(e.name for e in resolvable)
+    return True, f"模型就绪: {ready_names}"
+
+
 def _create_parent(path: Path) -> None:
     """确保父目录存在。"""
     parent = path.parent

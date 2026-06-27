@@ -238,30 +238,29 @@ def _print_welcome_banner() -> None:
 
     console.print(table)
 
+    # ── 就绪检查 ──
+    from agent_hub.model_config import check_system_ready
+    llm_ready, llm_msg = check_system_ready()
+
     # ── 上下文提示 ──
-    if not model_entries:
-        tip = (
-            "[yellow]💡 检测到未配置模型，请先添加:[/yellow]\n"
-            "   输入 [bold]models add[/bold] 进入引导式配置，"
-            "或 [bold]models add deepseek-v4-pro -k DEEPSEEK_API_KEY[/bold]"
-        )
+    if not llm_ready:
+        tip = f"[red]⚠ {llm_msg}[/red]"
     elif not agents_dict or len(agents_dict) <= 1:
         tip = (
             "[yellow]💡 提示:[/yellow] "
-            "使用 [bold]agent register <项目路径>[/bold] 注册专业 Agent，"
+            "使用 [bold]agent register[/bold] 注册专业 Agent，"
             "或 [bold]models add[/bold] 添加更多模型"
         )
     elif not system_running:
         tip = (
             "[yellow]💡 已就绪:[/yellow] "
             "输入 [bold]start[/bold] 启动 Agent 系统，"
-            "或 [bold]run \"任务描述\"[/bold] 直接执行任务"
+            "或直接输入任务描述开始工作"
         )
     else:
         tip = (
             "[yellow]💡 系统运行中:[/yellow] "
-            "输入 [bold]run \"任务描述\"[/bold] 执行任务，"
-            "[bold]stop[/bold] 停止系统，[bold]status[/bold] 查看状态"
+            "直接输入任务描述，或 [bold]stop[/bold] 停止系统"
         )
     console.print(f"\n{tip}")
     console.print()
@@ -1289,7 +1288,14 @@ def run(task: str | None, no_dashboard: bool, timeout: int):
 
 def _run_task(task: str, no_dashboard: bool, timeout: int):
     """执行单个任务。"""
+    from agent_hub.model_config import check_system_ready
     from agent_hub.scheduler import AgentScheduler
+
+    # 前置检查：模型是否就绪
+    ready, msg = check_system_ready()
+    if not ready:
+        console.print(f"[red]✗ {msg}[/red]")
+        return
 
     async def _exec():
         scheduler = AgentScheduler(

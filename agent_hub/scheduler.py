@@ -243,6 +243,19 @@ class AgentScheduler:
         """
         start_time = time_mod.monotonic()
 
+        # Step 0: 前置检查 — LLM 是否就绪
+        try:
+            from agent_hub.model_config import check_system_ready
+            llm_ready, llm_msg = check_system_ready()
+            if not llm_ready:
+                return SchedulerResult(
+                    user_input=user_input,
+                    route_plan=RoutePlan(tasks=[], analysis=llm_msg),
+                    total_duration_ms=(time_mod.monotonic() - start_time) * 1000,
+                )
+        except Exception:
+            pass  # 模型配置检查失败不应阻止后续执行（环境变量可能仍可用）
+
         # Step 1: 发现 Agent
         if agents is None:
             agents = self._load_agents()
@@ -251,7 +264,10 @@ class AgentScheduler:
         if not agents:
             return SchedulerResult(
                 user_input=user_input,
-                route_plan=RoutePlan(tasks=[], analysis="没有可用的 Agent"),
+                route_plan=RoutePlan(
+                    tasks=[],
+                    analysis="未发现任何 Agent。请先注册: agent register <项目路径>",
+                ),
                 total_duration_ms=(time_mod.monotonic() - start_time) * 1000,
             )
 
