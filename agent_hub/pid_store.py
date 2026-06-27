@@ -108,6 +108,9 @@ class PidFileStore:
         使用 taskkill (Windows) 或 SIGTERM (Unix) 终止进程，
         等待 grace_period 秒后强制终止未响应的进程。
 
+        注意：subprocess.run 通过 asyncio.to_thread 卸载到线程池，
+        避免阻塞事件循环。
+
         Args:
             grace_period: 优雅终止等待秒数（仅 Unix 有效）
 
@@ -122,11 +125,11 @@ class PidFileStore:
         stopped = 0
 
         if sys.platform == "win32":
-            # Windows: 使用 taskkill
+            # Windows: 使用 taskkill（通过线程池避免阻塞事件循环）
             for name, proc in processes.items():
                 try:
-                    # /F: 强制终止, /T: 终止子进程树
-                    result = subprocess.run(
+                    result = await asyncio.to_thread(
+                        subprocess.run,
                         ["taskkill", "/PID", str(proc.pid), "/F", "/T"],
                         capture_output=True, timeout=10,
                     )

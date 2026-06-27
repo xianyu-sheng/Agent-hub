@@ -17,10 +17,11 @@ DAG 执行策略：
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
-import time
+import time as time_mod
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -558,9 +559,6 @@ class AgentScheduler:
         不生成子进程 — 直接调用 AgentScheduler 自身的方法。
         这是防止 agent-hub 自调用时产生无限递归的关键机制。
         """
-        import json
-        import time as time_mod
-
         start_time = time_mod.monotonic()
 
         try:
@@ -593,9 +591,33 @@ class AgentScheduler:
                 output = "\n".join(lines) if lines else "No agents match the filter."
 
             elif task.task == "aggregate_results":
+                # 将 params 中的 dict 结果转换为 TaskExecutionResult 列表
+                raw_results = task.params.get("results", [])
+                parsed_results: list[TaskExecutionResult] = []
+                for r in raw_results:
+                    if isinstance(r, TaskExecutionResult):
+                        parsed_results.append(r)
+                    elif isinstance(r, dict):
+                        # 从 dict 重建 TaskExecutionResult
+                        rt = r.get("task", {})
+                        routed = RoutedTask(
+                            id=rt.get("id", 0),
+                            agent=rt.get("agent", "unknown"),
+                            task=rt.get("task", ""),
+                            description=rt.get("description", ""),
+                            params=rt.get("params", {}),
+                            depends_on=rt.get("depends_on", []),
+                        )
+                        parsed_results.append(TaskExecutionResult(
+                            task=routed,
+                            success=r.get("success", False),
+                            output=str(r.get("output", "")),
+                            error=str(r.get("error", "")),
+                            duration_ms=float(r.get("duration_ms", 0)),
+                        ))
                 output = await self._aggregate(
                     task.params.get("user_input", ""),
-                    task.params.get("results", []),
+                    parsed_results,
                     task.params.get("analysis", ""),
                 )
 

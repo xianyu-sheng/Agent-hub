@@ -257,8 +257,6 @@ def _print_welcome_banner() -> None:
 
 def _repl_help() -> None:
     """打印 REPL 帮助信息。"""
-    from rich.columns import Columns
-
     console.print()
     console.rule("[bold]📖 可用命令[/bold]")
     console.print()
@@ -542,8 +540,6 @@ def agent_info(name: str):
         sys.exit(1)
 
     manifest = agents_dict[name]
-
-    import json
 
     console.print(Panel(
         f"[bold cyan]{manifest.display_name}[/bold cyan] (name: {manifest.name})\n\n"

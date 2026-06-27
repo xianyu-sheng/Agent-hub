@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import signal
 import time
 from dataclasses import dataclass, field
@@ -424,7 +425,6 @@ class CLIBridge:
         )
 
         # 简单的 shell 分词（支持引号）
-        import shlex
         try:
             return shlex.split(command_str)
         except ValueError:
@@ -584,7 +584,6 @@ class CLIBridge:
         daemon_cmd = daemon_cmd.replace("{goal}", "serve")
         daemon_cmd = daemon_cmd.replace("{task}", "serve")
 
-        import shlex
         try:
             return shlex.split(daemon_cmd)
         except ValueError:

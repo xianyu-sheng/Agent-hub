@@ -131,7 +131,16 @@ def _do_chat_completion(
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
+            # 防御性检查 — API 可能返回 200 + 错误体（如 cloudflare 拦截页）
+            choices = data.get("choices")
+            if choices and len(choices) > 0:
+                msg = choices[0].get("message")
+                if msg and msg.get("content"):
+                    return msg["content"]
+            # 检查是否有明确的错误信息
+            if data.get("error"):
+                logger.warning("LLM API 返回错误: %s", data["error"])
+            return None
     except (KeyboardInterrupt, SystemExit):
         # 不吞掉系统信号 — 让进程能正常退出
         raise
