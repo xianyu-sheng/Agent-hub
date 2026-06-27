@@ -96,14 +96,12 @@ def _start_repl() -> None:
     """
     import shlex
 
-    from click.testing import CliRunner
     from rich.prompt import Prompt as RichPrompt
 
     # ── 欢迎页（静态渲染一次）──────────────────────────────────────
     _print_welcome_banner()
 
     # ── REPL 循环 ──────────────────────────────────────────────────
-    runner = CliRunner()
 
     while True:
         try:
@@ -130,7 +128,7 @@ def _start_repl() -> None:
                 _print_welcome_banner()
                 continue
 
-            # ── 委托给 Click CliRunner ──
+            # ── 解析参数并委托给 Click（使用真实 stdin/stdout）──
             try:
                 args = shlex.split(line)
             except ValueError as e:
@@ -138,25 +136,26 @@ def _start_repl() -> None:
                 console.print("[dim]提示: 包含空格的参数请用引号包裹[/dim]")
                 continue
 
-            # CliRunner 捕获 SystemExit，不会杀死 REPL
+            # 使用 main.main(args, standalone_mode=False) 而非 CliRunner
+            # CliRunner 隔离 stdin，导致 RichPrompt.ask() 无法读取输入
             try:
-                result = runner.invoke(
-                    main, args,
-                    catch_exceptions=False,  # 让 click.confirm 等能直面用户
-                    standalone_mode=False,   # 不调用 sys.exit
-                )
+                with console.status("[dim]...[/dim]"):
+                    main.main(args=args, standalone_mode=False)
             except SystemExit:
-                # Click 命令内部调用 sys.exit(1) 等，不要杀死 REPL
+                # Click 命令内部 sys.exit(1) 不杀死 REPL
+                continue
+            except click.exceptions.Abort:
+                # click.confirm 用户取消
                 continue
             except Exception as exc:
-                console.print(f"[red]✗ 命令执行失败: {exc}[/red]")
+                msg = str(exc) if str(exc) else type(exc).__name__
+                console.print(f"[red]✗ 命令执行失败: {msg}[/red]")
                 continue
 
         except KeyboardInterrupt:
             console.print("\n[dim]按 Ctrl+C 再次或输入 quit 退出[/dim]")
             continue
         except SystemExit:
-            # 某些命令可能仍触发了 sys.exit，不要杀死 REPL
             continue
         except Exception as e:
             console.print(f"[red]✗ 内部错误: {e}[/red]")
