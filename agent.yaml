@@ -69,6 +69,23 @@ capabilities:
     max_concurrency: 5
     timeout: 300
 
+# ── 调度关系声明 ──
+# Agent-hub 是一个中央调度系统，以下列出它通过 CLI Bridge 调度的子 Agent。
+# 此字段供 resume-sync 等工具读取，用于在简历中体现多 Agent 协同架构。
+scheduled_agents:
+  - name: omniagent
+    repo: D:/OmniAgent_CLI
+    role: "通用 AI 编程 Agent — 基于 ReAct 多思考范式的代码分析、生成、重构与命令执行"
+    interface: cli
+  - name: smartbench
+    repo: D:/SmartBench
+    role: "代码质量诊断引擎 — 静态分析、性能基准测试、项目指纹识别"
+    interface: cli
+  - name: resume-sync
+    repo: D:/工作/resume-sync
+    role: "简历自动同步器 — Git 变更检测 → LLM 三阶段流水线 → LaTeX 编译 → PDF 输出"
+    interface: cli
+
 interface:
   # internal 协议的 command 不会被实际调用，仅用于通过验证
   command: internal://dispatch

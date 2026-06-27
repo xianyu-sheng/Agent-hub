@@ -255,6 +255,48 @@ interface:
 | `mcp` | MCP 协议（预留） |
 | `http` | HTTP 接口（预留） |
 
+### 调度关系声明 (`scheduled_agents`)
+
+当一个 Agent 是**调度/编排系统**（通过 CLI Bridge 调度其他 Agent）时，应在 `agent.yaml` 中声明 `scheduled_agents`，描述它调度的子 Agent 及其角色：
+
+```yaml
+# agent-hub 的 agent.yaml 示例
+name: agent-hub
+display_name: "Agent Hub Scheduler"
+protocol: internal
+
+scheduled_agents:
+  - name: omniagent
+    repo: D:/OmniAgent_CLI
+    role: "通用 AI 编程 Agent — 代码分析、生成、重构、命令执行"
+    interface: cli
+  - name: smartbench
+    repo: D:/SmartBench
+    role: "代码质量诊断引擎 — 静态分析、性能基准、项目指纹"
+    interface: cli
+  - name: resume-sync
+    repo: D:/工作/resume-sync
+    role: "简历自动同步器 — Git 变更检测 → LLM 生成 → LaTeX 编译"
+    interface: cli
+```
+
+**字段说明**：
+
+| 字段 | 必需 | 说明 |
+|------|------|------|
+| `name` | ✅ | 子 Agent 名称（需与对应 agent.yaml 中的 `name` 一致） |
+| `repo` | ✅ | 子 Agent 项目根目录的绝对路径 |
+| `role` | ✅ | 子 Agent 在调度系统中的角色（1-2 句话，供 resume-sync 等下游工具生成简历时使用） |
+| `interface` | ❌ | 调度接口类型（`cli` / `mcp` / `http`，默认 `cli`） |
+
+**用途**：
+
+- **resume-sync 集成**：生成简历要点时自动读取 `scheduled_agents`，注入子项目关系上下文，使 LLM 产出体现系统架构层级的描述（例如"设计了一套多 Agent 协同调度系统"而非"做了 3 个独立项目"）
+- **健康检查**（规划中）：`agent-hub start` 仪表盘可按调度关系展示拓扑
+- **文档自生成**：下游工具可据此生成架构图、依赖关系图
+
+> 💡 **设计原则**：`scheduled_agents` 描述的是"调度关系"，不是"依赖关系"。如果 Agent A 只是调用了 Agent B 的 API（而非通过 Agent Manifest 协议调度），不应列在此处。
+
 ---
 
 ## 🏗️ 架构
