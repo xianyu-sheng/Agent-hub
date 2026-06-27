@@ -314,6 +314,38 @@ pytest tests/ -v           # 30 tests
 
 ---
 
+## 🩺 故障排查
+
+### 任务执行超时（300s Timeout）
+
+**症状**：`agent-hub run "编写代码"` 路由到 omniagent 后挂起，300 秒超时。
+
+**根因**：omniagent 收到任务后进入交互式 REPL（`Prompt.ask()`），与 agent-hub 竞争终端 stdin，导致永久阻塞。
+
+**修复**（两个层面）：
+
+1. **OmniAgent ≥ feat/headless-execution**：新增 `--goal` 参数支持非交互模式（自动批准工具调用、结果输出到 stdout 后退出）。agent.yaml 命令模板已更新为：
+   ```
+   omniagent --mode {mode} --goal "{goal}"
+   ```
+
+2. **Agent-hub ≥ fix/stdin-devnull**：bridge.py 子进程启动时设置 `stdin=DEVNULL`，防止任何 Agent 意外竞争终端输入。即使 Agent 进入 REPL，也会因 EOF 立即退出而非挂起。
+
+**验证**：
+```bash
+# 直接测试 omniagent headless 模式
+omniagent --mode react --goal "写一个 Python 快速排序函数"
+
+# 全链路测试
+agent-hub run "写一个 Python 快速排序函数"
+```
+
+### Agent 命令未找到
+
+确保 Agent 的 CLI 入口已安装到 PATH（如 `pip install -e .`），或 agent.yaml 中 `interface.command` 使用完整路径。
+
+---
+
 ## 🗺️ 路线图
 
 - [x] Agent Manifest 协议 (agent.yaml)
