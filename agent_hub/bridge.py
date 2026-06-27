@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import signal
 import time
@@ -552,11 +553,17 @@ class CLIBridge:
             return existing
 
         # 构建启动命令
-        # 对于 CLI Agent，使用"守护模式"——持续运行的 REPL
-        cmd = self._build_daemon_command(manifest)
+        raw_cmd = self._build_daemon_command(manifest)
         env = self._build_env(manifest, None)
 
-        logger.info("启动 Agent: %s cmd=%s", name, " ".join(cmd))
+        # 处理 shell 语法（cd <path> &&）
+        cwd = manifest.source_path or None
+        cmd = self._strip_shell_prefix(raw_cmd)
+        extracted_cwd = self._extract_cd_path(raw_cmd)
+        if extracted_cwd:
+            cwd = extracted_cwd
+
+        logger.info("启动 Agent: %s cmd=%s cwd=%s", name, " ".join(cmd), cwd)
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -564,7 +571,7 @@ class CLIBridge:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
-                cwd=manifest.source_path or None,
+                cwd=cwd,
             )
 
             info = self.registry.register(name, process, manifest)
@@ -631,7 +638,6 @@ class CLIBridge:
             daemon_cmd = daemon_cmd.replace("{project}", "")
 
         # 策略 3：清理残留占位符并尝试
-        import re
         daemon_cmd = re.sub(r"\{[^}]*\}", "", daemon_cmd).strip()
 
         if daemon_cmd:

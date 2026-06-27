@@ -350,14 +350,14 @@ def start(agents: str | None):
 
     if not registry_dir.is_dir():
         console.print(f"[red]✗ 注册目录不存在: {registry_dir}[/red]")
-        console.print("[dim]请先使用 'agent-hub agent register <项目路径>' 注册 Agent[/dim]")
-        sys.exit(1)
+        console.print("[dim]请先使用 'agent register' 注册 Agent[/dim]")
+        return
 
     agents_dict = _load_all_agents()
     if not agents_dict:
         console.print("[red]✗ 未发现任何 Agent[/red]")
         console.print(f"[dim]请在 {registry_dir}/ 中添加注册文件[/dim]")
-        sys.exit(1)
+        return
 
     console.print(f"[dim]发现 {len(agents_dict)} 个 Agent:[/dim]")
     for name, manifest in agents_dict.items():
@@ -369,7 +369,7 @@ def start(agents: str | None):
         agents_dict = {k: v for k, v in agents_dict.items() if k in agent_names}
         if not agents_dict:
             console.print(f"[red]✗ 指定的 Agent 未找到: {agents}[/red]")
-            sys.exit(1)
+            return
 
     async def _start():
         from agent_hub.dashboard import HealthDashboard
@@ -704,7 +704,7 @@ def agent_models(name: str | None):
             console.print(f"[red]✗ 未找到 Agent: {name}[/red]")
             available = ", ".join(sorted(agents_dict.keys()))
             console.print(f"[dim]可用: {available}[/dim]")
-            sys.exit(1)
+            return
 
         manifest = agents_dict[name]
         models = manifest.capabilities.models
@@ -751,7 +751,7 @@ def agent_validate():
     registry_dir = _resolve_registry_dir()
     if not registry_dir.is_dir():
         console.print(f"[yellow]⚠ 注册目录不存在: {registry_dir}[/yellow]")
-        sys.exit(1)
+        return
 
     all_valid = True
     agent_count = 0
@@ -799,7 +799,7 @@ def agent_validate():
         console.print(f"\n[green]✅ 全部 {agent_count} 个 Agent 验证通过[/green]")
     else:
         console.print(f"\n[yellow]⚠ 部分 Agent 验证失败，请修正对应 agent.yaml[/yellow]")
-        console.print("[dim]提示: 手动编辑项目目录下的 agent.yaml，然后运行 'agent-hub agent reload'[/dim]")
+        console.print("[dim]提示: 手动编辑项目目录下的 agent.yaml，然后运行 agent reload[/dim]")
 
 
 # ── 模型自动识别映射 ──────────────────────────────────────────────
@@ -1242,7 +1242,7 @@ def models_priority(set_priority: str | None):
             console.print(f"[green]✅ 模型优先级已更新:[/green]")
         except ValueError as e:
             console.print(f"[red]✗ {e}[/red]")
-            sys.exit(1)
+            return
     else:
         console.print("[bold]当前模型优先级:[/bold]")
 
