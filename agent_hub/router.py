@@ -182,12 +182,15 @@ class IntentRouter:
         # 构建 Agent 描述 → system prompt
         agent_descriptions = self._build_agent_descriptions(agents)
 
+        # 优化用户输入：添加任务映射指引
+        optimized_input = self._optimize_input(user_input, agents)
+
         # 调用 LLM 进行意图路由
         messages = [
             {"role": "system", "content": self.ROUTER_SYSTEM_PROMPT.format(
                 agent_descriptions=agent_descriptions,
             )},
-            {"role": "user", "content": user_input},
+            {"role": "user", "content": optimized_input},
         ]
 
         if extra_context:
@@ -451,6 +454,40 @@ class IntentRouter:
         )
 
     # ── 辅助 ─────────────────────────────────────────────────────
+
+    def _optimize_input(
+        self, user_input: str, agents: dict[str, AgentManifest]
+    ) -> str:
+        """优化用户输入 — 添加任务映射指引，帮助 LLM 精确匹配任务。
+
+        类似 omniagent 的 prompt optimizer，在用户原始输入前追加结构化指引：
+        1. 强调使用精确的任务名（不可臆造）
+        2. 给出多步骤任务的拆分示例
+        3. 优先匹配最相关的 Agent
+        """
+        # 构建任务快速索引
+        task_index_lines: list[str] = []
+        for name, agent in sorted(agents.items()):
+            for t in agent.capabilities.tasks:
+                task_index_lines.append(
+                    f"  [{name}] {t.name} — {t.description}"
+                )
+
+        task_index = "\n".join(task_index_lines)
+
+        return (
+            f"{user_input}\n\n"
+            f"--- 任务匹配指引 ---\n"
+            f"请将上述用户需求分解为具体任务。务必使用以下精确任务名（不可臆造名称）:\n"
+            f"{task_index}\n\n"
+            f"规则:\n"
+            f"- 如果用户说「更新简历」「同步简历」，优先路由到 resume-sync 的 run 任务\n"
+            f"- 如果用户说「分析代码」「诊断项目」，优先路由到 smartbench 的 diagnose_code 或 fingerprint_project\n"
+            f"- 如果用户说「写代码」「改bug」，优先路由到 omniagent 的对应任务\n"
+            f"- 涉及多个 Agent 时，分析依赖关系（如先诊断再修改）\n"
+            f"- params.goal 填入用户的具体需求描述（中文，完整保留原始语义）\n"
+            f"- 任务名必须和上述索引中的完全一致，不要自创名称"
+        )
 
     @staticmethod
     def _build_agent_descriptions(agents: dict[str, AgentManifest]) -> str:
