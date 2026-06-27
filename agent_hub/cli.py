@@ -194,11 +194,10 @@ def _print_welcome_banner() -> None:
     except Exception:
         pass
     # CLI Agent 按需调用，只要模型就绪即可工作
+    from agent_hub.model_config import check_system_ready
+    llm_ready, llm_msg = check_system_ready()
     if not system_running:
-        from agent_hub.model_config import check_system_ready
-        llm_ok, _ = check_system_ready()
-        # 有模型 + 有 Agent = 可工作
-        system_running = llm_ok and len(agents_dict) > 1
+        system_running = llm_ready and len(agents_dict) > 1
 
     # ── Header ──
     console.print()
@@ -407,54 +406,54 @@ def start(agents: str | None):
             "command": manifest.interface.command[:60],
         })
 
-    # ── 渲染结果 ──
-    console.print()
-    console.rule("[bold white]🚀 Agent 系统启动[/bold white]")
-    console.print()
+    # ── 构建仪表盘数据 ──
+    dash_agents = [
+        {
+            "name": r["name"],
+            "icon": _agent_icon(r["name"]),
+            "display": r["display"],
+            "exe": r["exe"],
+            "ready": r["ready"],
+            "status": r["status"],
+            "tasks": r["tasks"],
+        }
+        for r in results
+    ]
 
-    table = Table(title="Agent 就绪状态")
-    table.add_column("Agent", style="cyan bold")
-    table.add_column("显示名")
-    table.add_column("可执行文件", style="dim")
-    table.add_column("状态")
-    table.add_column("任务数")
+    # 模型数据
+    from agent_hub.model_config import ModelConfigStore
+    model_store = ModelConfigStore()
+    model_entries = model_store.list_all()
+    dash_models = [
+        {"name": e.name, "provider": e.provider, "default": e.default}
+        for e in model_entries
+    ]
 
-    for r in results:
-        status_style = "green" if r["ready"] else "red"
-        table.add_row(
-            f"{_agent_icon(r['name'])} {r['name']}",
-            r["display"],
-            r["exe"],
-            f"[{status_style}]{r['status']}[/{status_style}]",
-            str(r["tasks"]),
-        )
+    # ── 渲染仪表盘 ──
+    from agent_hub.dashboard import StartDashboard
+    import time as _time
 
-    console.print(table)
+    dash = StartDashboard(console, title="Agent Hub — 多 Agent 中央调度系统")
+    dash.set_agents(dash_agents)
+    dash.set_models(dash_models)
+    dash.internal_count = len(internal_agents)
 
-    # Internal agents
-    if internal_agents:
-        console.print()
-        console.print("[dim]内部 Agent（进程内运行，无需外部工具）:[/dim]")
-        for name, m in sorted(internal_agents.items()):
-            console.print(f"  {_agent_icon(name)} [green]{name}[/green] — {len(m.capabilities.tasks)} tasks [dim](internal)[/dim]")
-
-    # Summary
     ready_count = sum(1 for r in results if r["ready"])
-    total = len(results)
-    console.print()
-    if ready_count == total and total > 0:
-        console.print(f"[green]✅ 全部 {total} 个 Agent 就绪！系统已启动。[/green]")
-        console.print("[dim]直接输入任务描述即可开始工作，或输入 help 查看命令[/dim]")
-    elif total > 0:
-        console.print(f"[yellow]⚠ {ready_count}/{total} 个 Agent 就绪。[/yellow]")
-        console.print("[dim]未就绪的 Agent 在执行任务时可能会失败[/dim]")
-        # 给出修复建议
-        failed = [r for r in results if not r["ready"]]
-        for f in failed:
-            console.print(f"  [red]• {f['name']}[/red]: 可执行文件 [bold]{f['exe']}[/bold] 未找到")
-            console.print(f"    [dim]请确保已安装并加入 PATH，或更新 agent.yaml 中的 interface.command[/dim]")
-    else:
-        console.print("[yellow]⚠ 没有外部 Agent。使用 agent register 注册专业 Agent。[/yellow]")
+    if ready_count == len(results) and results:
+        dash.footer_text = f"✅ 全部 {len(results)} 个 Agent 就绪！系统已启动，输入任务开始工作"
+    elif results:
+        failed_names = ", ".join(r["name"] for r in results if not r["ready"])
+        dash.footer_text = f"⚠ {ready_count}/{len(results)} 就绪 · 未就绪: {failed_names}"
+
+    with dash.run():
+        dash.render()
+        # 动画：逐个点亮 Agent 状态
+        import asyncio as _asyncio
+        for i in range(len(dash_agents) + 1):
+            # 分阶段更新显示进度
+            dash.render()
+            _time.sleep(0.15)
+        _time.sleep(1.5)  # 展示 1.5 秒
 
     console.print()
 
