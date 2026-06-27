@@ -262,19 +262,20 @@ def _repl_help() -> None:
 
     commands = [
         ("[bold cyan]模型配置[/bold cyan]", ""),
+        ("  models add", "交互式引导添加（只需模型名 + API Key）"),
+        ("  models add <name> -k <KEY>", "快速添加（自动识别供应商/API）"),
         ("  models list", "列出已配置的 LLM 模型"),
-        ("  models add", "交互式引导添加模型（只需模型名 + API Key）"),
-        ("  models add <name> -k <KEY>", "快速添加（自动识别供应商和 API 地址）"),
-        ("  models remove <name>", "删除模型"),
-        ("  models info <name>", "模型详情"),
-        ("  models priority [--set a,b,c]", "查看/设置模型优先级"),
+        ("  models remove", "交互式选择删除"),
+        ("  models update", "交互式引导更新"),
+        ("  models info", "模型详情"),
+        ("  models priority", "查看/设置模型优先级"),
         ("", ""),
         ("[bold cyan]Agent 管理[/bold cyan]", ""),
+        ("  agent register", "交互式引导注册新 Agent"),
         ("  agent list", "列出所有已注册 Agent"),
-        ("  agent info <name>", "查看 Agent 详情"),
-        ("  agent register <项目路径>", "注册新 Agent"),
+        ("  agent info", "查看 Agent 详情（可选指定名称）"),
         ("  agent validate", "验证所有 agent.yaml"),
-        ("  agent models [name]", "查看 Agent 声明的模型"),
+        ("  agent models", "查看 Agent 声明的模型"),
         ("", ""),
         ("[bold cyan]系统控制[/bold cyan]", ""),
         ("  start", "启动所有 Agent（进入健康监控面板）"),
@@ -282,7 +283,7 @@ def _repl_help() -> None:
         ("  status", "刷新系统概览"),
         ("", ""),
         ("[bold cyan]任务执行[/bold cyan]", ""),
-        ("  run <任务描述>", "执行多 Agent 任务（自然语言）"),
+        ("  run <任务>", "执行多 Agent 任务（自然语言）"),
         ("  run", "进入交互式任务模式"),
         ("", ""),
         ("[bold cyan]其他[/bold cyan]", ""),
@@ -528,16 +529,31 @@ def agent_list():
 
 
 @agent.command("info")
-@click.argument("name")
-def agent_info(name: str):
-    """查看指定 Agent 的完整配置。"""
-    agents_dict = _load_all_agents()
+@click.argument("name", required=False)
+def agent_info(name: str | None):
+    """查看指定 Agent 的完整配置。
 
-    if name not in agents_dict:
-        console.print(f"[red]✗ 未找到 Agent: {name}[/red]")
-        available = ", ".join(sorted(agents_dict.keys()))
-        console.print(f"[dim]可用: {available}[/dim]")
-        sys.exit(1)
+    NAME: 可选，不指定则列出所有 Agent 供选择。
+    """
+    from rich.prompt import Prompt as RichPrompt
+
+    agents_dict = _load_all_agents()
+    if not agents_dict:
+        console.print("[dim]未发现任何注册的 Agent[/dim]")
+        return
+
+    # 交互模式：未指定名称 → 列出可选
+    if not name:
+        console.print()
+        console.print("[bold]已注册 Agent:[/bold]")
+        for n, m in sorted(agents_dict.items()):
+            icon = _agent_icon(n)
+            console.print(f"  {icon} [cyan]{n}[/cyan] — {m.display_name} [dim]({m.protocol}, {len(m.capabilities.tasks)} tasks)[/dim]")
+        console.print()
+        name = RichPrompt.ask("选择 Agent", default="agent-hub")
+        if not name or name not in agents_dict:
+            console.print(f"[red]✗ 未找到 Agent: {name}[/red]")
+            return
 
     manifest = agents_dict[name]
 
@@ -559,28 +575,52 @@ def agent_info(name: str):
 
 
 @agent.command("register")
-@click.argument("project_path")
-def agent_register(project_path: str):
-    """注册新 Agent。
+@click.argument("project_path", required=False)
+def agent_register(project_path: str | None):
+    """注册新 Agent — 交互式引导。
 
-    PROJECT_PATH: 专业 Agent 的项目目录路径（如 D:/OmniAgent_CLI）
+    \b
+    交互模式：agent register          ← 引导式输入项目路径
+    CLI 模式：agent register <路径>    ← 直接注册
     """
+    from rich.prompt import Prompt as RichPrompt
+
+    # 交互模式
+    if not project_path:
+        console.print()
+        console.rule("[bold cyan]🔗 注册新 Agent[/bold cyan]")
+        console.print()
+        console.print("[dim]输入 Agent 项目的目录路径（包含 agent.yaml 的项目）[/dim]")
+
+        # 显示已注册的 Agent
+        existing = _load_all_agents()
+        if existing:
+            console.print("[bold]已注册:[/bold]")
+            for n, m in sorted(existing.items()):
+                console.print(f"  {_agent_icon(n)} [cyan]{n}[/cyan] → {m.source_path or '—'}")
+            console.print()
+
+        project_path = RichPrompt.ask("项目路径")
+        if not project_path or not project_path.strip():
+            console.print("[red]✗ 路径不能为空[/red]")
+            return
+        project_path = project_path.strip()
+
     project = Path(project_path)
     if not project.is_dir():
         console.print(f"[red]✗ 目录不存在: {project}[/red]")
-        sys.exit(1)
+        return
 
     agent_yaml = project / "agent.yaml"
     if not agent_yaml.exists():
         console.print(f"[yellow]⚠ {project}/ 中没有找到 agent.yaml[/yellow]")
         console.print("[dim]正在生成 agent.yaml 模板...[/dim]")
 
-        # 自动检测项目类型并生成模板
         project_name = project.name.lower().replace("-", "_").replace(" ", "_")
         template = _generate_agent_yaml_template(project_name, project)
         agent_yaml.write_text(template, encoding="utf-8")
         console.print(f"[green]✅ 已生成 {agent_yaml}[/green]")
-        console.print("[dim]请编辑此文件以完善 Agent 描述，然后运行 'agent-hub agent reload'[/dim]")
+        console.print("[dim]请编辑此文件以完善 Agent 描述，然后重载[/dim]")
 
     # 在 agents.d/ 中创建注册文件
     registry_dir = _resolve_registry_dir()
@@ -610,9 +650,9 @@ def agent_register(project_path: str):
         reg_content += f"# 任务数: {len(manifest.capabilities.tasks)}\n"
 
     reg_file.write_text(reg_content, encoding="utf-8")
-    console.print(f"[green]✅ 已注册: {reg_file}[/green]")
+    console.print(f"[green]✅ 已注册: [bold]{reg_name}[/bold][/green]")
     console.print(f"[dim]  指向 → {project.resolve()}[/dim]")
-    console.print("[dim]运行 'agent-hub agent reload' 加载新配置[/dim]")
+    console.print(f"[dim]已就绪！输入 agent validate 验证，或 start 启动系统[/dim]")
 
 
 @agent.command("reload")
@@ -852,22 +892,38 @@ def models_list():
 
 
 @models.command("info")
-@click.argument("name")
-def models_info(name: str):
-    """查看指定模型的完整配置。"""
+@click.argument("name", required=False)
+def models_info(name: str | None):
+    """查看指定模型的完整配置。
+
+    NAME: 可选，不指定则列出所有模型供选择。
+    """
     from agent_hub.model_config import ModelConfigStore
+    from rich.prompt import Prompt as RichPrompt
 
     store = ModelConfigStore()
-    entry = store.get(name)
+    entries = store.list_all()
 
+    if not entries:
+        console.print("[dim]未配置任何模型[/dim]")
+        console.print("[dim]输入 'models add' 添加模型[/dim]")
+        return
+
+    if not name:
+        console.print()
+        console.print("[bold]已配置模型:[/bold]")
+        for e in entries:
+            star = "⭐ " if e.default else "  "
+            console.print(f"  {star}[cyan]{e.name}[/cyan] [dim]({e.provider})[/dim] → {e.api_base}")
+        console.print()
+        name = RichPrompt.ask("选择模型", default=entries[0].name)
+        if not name:
+            return
+
+    entry = store.get(name)
     if not entry:
         console.print(f"[red]✗ 未找到模型: {name}[/red]")
-        available = ", ".join(e.name for e in store.list_all())
-        if available:
-            console.print(f"[dim]已配置: {available}[/dim]")
-        else:
-            console.print("[dim]输入 'models add' 添加模型[/dim]")
-        sys.exit(1)
+        return
 
     console.print(Panel(
         f"[bold cyan]{entry.name}[/bold cyan]\n\n"
@@ -1002,63 +1058,134 @@ def models_add(
 
 
 @models.command("remove")
-@click.argument("name")
+@click.argument("name", required=False)
 @click.option("--yes", "-y", is_flag=True, help="跳过确认")
-def models_remove(name: str, yes: bool):
-    """删除指定的模型配置。
+def models_remove(name: str | None, yes: bool):
+    """删除模型配置 — 交互式选择。
 
-    NAME: 要删除的模型名
+    \b
+    交互模式：models remove         ← 列出所有模型供选择
+    CLI 模式：models remove <name>  ← 直接删除
     """
     from agent_hub.model_config import ModelConfigStore
+    from rich.prompt import Prompt as RichPrompt
 
     store = ModelConfigStore()
+    entries = store.list_all()
+
+    if not entries:
+        console.print("[dim]未配置任何模型，无需删除[/dim]")
+        return
+
+    # 交互模式：列出可选
+    if not name:
+        console.print()
+        console.print("[bold]已配置模型:[/bold]")
+        for e in entries:
+            star = "⭐ " if e.default else "  "
+            console.print(f"  {star}[cyan]{e.name}[/cyan] [dim]({e.provider})[/dim]")
+        console.print()
+        name = RichPrompt.ask("要删除的模型名称")
+        if not name:
+            return
+
     entry = store.get(name)
     if not entry:
         console.print(f"[red]✗ 未找到模型: {name}[/red]")
-        sys.exit(1)
+        available = ", ".join(e.name for e in entries)
+        console.print(f"[dim]可用: {available}[/dim]")
+        return
 
     if not yes:
-        console.print(f"[yellow]⚠ 确认删除模型 '{name}'？[/yellow]")
+        console.print(f"[yellow]⚠ 确认删除模型 '{name}' ({entry.provider})？[/yellow]")
         if not click.confirm("删除后无法恢复，是否继续？"):
             console.print("[dim]已取消[/dim]")
             return
 
     store.remove(name)
-    console.print(f"[green]✅ 已删除模型: {name}[/green]")
+    console.print(f"[green]✅ 已删除模型: [bold]{name}[/bold][/green]")
 
 
 @models.command("update")
-@click.argument("name")
-@click.option("--api-key", default=None, help="新的 API Key（明文）")
-@click.option("--api-key-env", default=None, help="新的 API Key 环境变量名")
+@click.argument("name", required=False)
+@click.option("--api-key", "-k", default=None, help="新的 API Key 或环境变量名")
 @click.option("--api-base", default=None, help="新的 API Base URL")
 @click.option("--provider", default=None, help="新的供应商名")
 @click.option("--set-default", is_flag=True, help="设为默认模型")
 def models_update(
-    name: str,
+    name: str | None,
     api_key: str | None,
-    api_key_env: str | None,
     api_base: str | None,
     provider: str | None,
     set_default: bool,
 ):
-    """更新指定模型的配置。
+    """更新模型配置 — 交互式引导。
 
-    NAME: 要更新的模型名
+    \b
+    交互模式：models update         ← 选择模型 + 引导式更新
+    CLI 模式：models update <name> -k NEW_KEY
     """
     from agent_hub.model_config import ModelConfigStore
-
-    if api_key and api_key_env:
-        console.print("[red]✗ --api-key 和 --api-key-env 不能同时指定[/red]")
-        sys.exit(1)
+    from rich.prompt import Prompt as RichPrompt
 
     store = ModelConfigStore()
+    entries = store.list_all()
 
+    if not entries:
+        console.print("[dim]未配置任何模型[/dim]")
+        console.print("[dim]输入 'models add' 添加模型[/dim]")
+        return
+
+    # 交互模式
+    if not name:
+        console.print()
+        console.rule("[bold cyan]✏️ 更新模型配置[/bold cyan]")
+        console.print()
+
+        console.print("[bold]已配置模型:[/bold]")
+        for e in entries:
+            star = "⭐ " if e.default else "  "
+            console.print(f"  {star}[cyan]{e.name}[/cyan] [dim]({e.provider})[/dim] → {e.api_base}")
+        console.print()
+        name = RichPrompt.ask("选择要更新的模型", default=entries[0].name)
+        if not name:
+            return
+
+    entry = store.get(name)
+    if not entry:
+        console.print(f"[red]✗ 未找到模型: {name}[/red]")
+        return
+
+    # 如果用户未提供任何更新参数 → 交互模式
+    if not api_key and not api_base and not provider and not set_default:
+        console.print()
+        console.print(f"[bold]正在更新: [cyan]{entry.name}[/cyan][/bold]")
+        console.print(f"  当前 Key: {'***' if entry.api_key else '—'} [dim]({entry.api_key})[/dim]")
+        console.print(f"  当前 API: {entry.api_base or '—'}")
+        console.print(f"  供应商:   {entry.provider or '—'}")
+        console.print()
+
+        console.print("[dim]输入新值（留空保持原值）[/dim]")
+
+        new_key = RichPrompt.ask("API Key（或环境变量名）")
+        if new_key and new_key.strip():
+            api_key = new_key.strip()
+
+        new_base = RichPrompt.ask("API Base URL")
+        if new_base and new_base.strip():
+            api_base = new_base.strip()
+
+        new_prov = RichPrompt.ask("供应商名")
+        if new_prov and new_prov.strip():
+            provider = new_prov.strip()
+
+        set_default = click.confirm("设为默认模型？", default=False)
+        console.print()
+
+    # ── 构建更新参数 ──
     kwargs: dict = {}
     if api_key:
-        kwargs["api_key"] = api_key
-    if api_key_env:
-        kwargs["api_key"] = f"${{{api_key_env}}}"
+        kwargs["api_key"] = _smart_api_key(api_key)
     if api_base:
         kwargs["api_base"] = api_base
     if provider:
@@ -1068,18 +1195,19 @@ def models_update(
 
     if not kwargs:
         console.print("[yellow]⚠ 未指定要更新的字段[/yellow]")
-        console.print("[dim]示例: agent-hub models update gpt-4o --api-key-env OPENAI_API_KEY[/dim]")
         return
 
     try:
-        entry = store.update(name, **kwargs)
-        console.print(f"[green]✅ 已更新模型: {name}[/green]")
+        updated = store.update(name, **kwargs)
+        console.print(f"[green]✅ 已更新模型: [bold]{name}[/bold][/green]")
         if set_default:
             console.print(f"   ⭐ 已设为默认模型")
+        if "api_key" in kwargs:
+            key_display = kwargs["api_key"] if kwargs["api_key"].startswith("${") else "***"
+            console.print(f"   Key:  {key_display}")
         console.print(f"\n[dim]配置文件: {store._config_path}[/dim]")
     except ValueError as e:
         console.print(f"[red]✗ {e}[/red]")
-        sys.exit(1)
 
 
 @models.command("priority")
