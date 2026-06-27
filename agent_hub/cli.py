@@ -136,6 +136,20 @@ def _start_repl() -> None:
                 console.print("[dim]提示: 包含空格的参数请用引号包裹[/dim]")
                 continue
 
+            if not args:
+                continue
+
+            # ── 智能路由：自然语言 → 自动包装为 run 命令 ──
+            # 如果第一个词不是已知命令/子命令，视为自然语言任务描述
+            KNOWN_COMMANDS = {
+                "start", "stop", "status", "run",
+                "agent", "models",
+                "help", "?", "quit", "exit", "q", "clear", "cls",
+            }
+            if args[0] not in KNOWN_COMMANDS:
+                # 自然语言 → 作为 run 的任务参数
+                args = ["run", line]
+
             # 使用 main.main(args, standalone_mode=False) 而非 CliRunner
             # CliRunner 隔离 stdin，导致 RichPrompt.ask() 无法读取输入
             try:
@@ -183,7 +197,7 @@ def _print_welcome_banner() -> None:
     # ── Header ──
     console.print()
     console.rule("[bold white]🔄 Agent Hub — 多 Agent 中央调度系统[/]")
-    console.print(f"[dim]v0.1.0 · 直接输入命令操作 · 输入 help 查看帮助 · quit 退出[/dim]")
+    console.print(f"[dim]v0.1.0 · 直接输入自然语言或命令 · help 查看帮助 · quit 退出[/dim]")
     console.print()
 
     # ── 系统概览表 ──
@@ -298,7 +312,8 @@ def _repl_help() -> None:
             console.print()
 
     console.print()
-    console.print("[dim]提示: 包含空格的参数请用引号包裹，如 run \"分析代码并更新简历\"[/dim]")
+    console.print("[dim]💡 直接输入自然语言即可执行任务，无需 run 前缀[/dim]")
+    console.print("[dim]   示例: 分析 agent-hub 代码质量 → 自动路由到合适的 Agent[/dim]")
     console.print()
 
 

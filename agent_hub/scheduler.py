@@ -241,7 +241,7 @@ class AgentScheduler:
         Returns:
             SchedulerResult 包含完整执行结果
         """
-        start_time = time.monotonic()
+        start_time = time_mod.monotonic()
 
         # Step 1: 发现 Agent
         if agents is None:
@@ -252,7 +252,7 @@ class AgentScheduler:
             return SchedulerResult(
                 user_input=user_input,
                 route_plan=RoutePlan(tasks=[], analysis="没有可用的 Agent"),
-                total_duration_ms=(time.monotonic() - start_time) * 1000,
+                total_duration_ms=(time_mod.monotonic() - start_time) * 1000,
             )
 
         self.console.print(f"[dim]发现 {len(agents)} 个 Agent: {', '.join(agents.keys())}[/dim]")
@@ -266,7 +266,7 @@ class AgentScheduler:
             return SchedulerResult(
                 user_input=user_input,
                 route_plan=route_plan,
-                total_duration_ms=(time.monotonic() - start_time) * 1000,
+                total_duration_ms=(time_mod.monotonic() - start_time) * 1000,
             )
 
         self.console.print(
@@ -280,7 +280,7 @@ class AgentScheduler:
         else:
             result = await self._execute_headless(user_input, route_plan, agents)
 
-        result.total_duration_ms = (time.monotonic() - start_time) * 1000
+        result.total_duration_ms = (time_mod.monotonic() - start_time) * 1000
         return result
 
     def _load_agents(self) -> dict[str, AgentManifest]:
