@@ -242,12 +242,19 @@ class CLIBridge:
             timeout = min(timeout, manifest.capabilities.constraints["timeout"])
 
         # 构建命令
-        cmd = self._build_command(manifest, task_name, params)
+        raw_cmd = self._build_command(manifest, task_name, params)
         env = self._build_env(manifest, extra_env)
 
+        # 处理 shell 语法：提取 cd <path> && 前缀，设置 cwd
+        cwd = manifest.source_path or None
+        cmd = self._strip_shell_prefix(raw_cmd)
+        extracted_cwd = self._extract_cd_path(raw_cmd)
+        if extracted_cwd:
+            cwd = extracted_cwd
+
         logger.info(
-            "执行 Agent: %s task=%s timeout=%ds cmd=%s",
-            manifest.name, task_name, timeout, " ".join(cmd),
+            "执行 Agent: %s task=%s timeout=%ds cwd=%s cmd=%s",
+            manifest.name, task_name, timeout, cwd, " ".join(cmd),
         )
 
         start_time = time.monotonic()
@@ -255,13 +262,13 @@ class CLIBridge:
         stderr_lines: list[str] = []
 
         try:
-            # 启动子进程
+            # 启动子进程（不使用 shell，直接调用可执行文件）
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
-                cwd=manifest.source_path or None,
+                cwd=cwd,
             )
 
             # 流式读取 stdout + stderr
@@ -431,6 +438,30 @@ class CLIBridge:
             # 回退：按空格分割
             return command_str.split()
 
+    @staticmethod
+    def _extract_cd_path(cmd: list[str]) -> str | None:
+        """从命令列表中提取 cd <path> && 中的路径。
+
+        例: ['cd', 'D:/proj', '&&', 'tool', '--flag']
+            → 'D:/proj'
+        """
+        if len(cmd) >= 3 and cmd[0] == "cd" and cmd[2] in ("&&", ";"):
+            path = cmd[1]
+            if path and Path(path).is_dir():
+                return path
+        return None
+
+    @staticmethod
+    def _strip_shell_prefix(cmd: list[str]) -> list[str]:
+        """去除命令中的 shell 前缀（cd <path> &&/;）。
+
+        例: ['cd', 'D:/proj', '&&', 'tool', '--flag']
+            → ['tool', '--flag']
+        """
+        if len(cmd) >= 3 and cmd[0] == "cd" and cmd[2] in ("&&", ";"):
+            return cmd[3:]
+        return cmd
+
     def _build_env(
         self,
         manifest: AgentManifest,
@@ -574,20 +605,47 @@ class CLIBridge:
     def _build_daemon_command(self, manifest: AgentManifest) -> list[str]:
         """构建 Agent 守护进程的启动命令。
 
-        对于 CLI Agent，使用 --daemon 或 --serve 标志。
-        如果没有守护模式，则启动一个交互式 REPL。
+        注意：不是所有 Agent 都支持守护模式。当前策略：
+        1. 如果 command 模板不含占位符 → 直接使用
+        2. 如果含 {mode} → 替换为 daemon 再试
+        3. 回退 → 提取基础命令（去掉占位符部分），尽量让进程跑起来
         """
         template = manifest.interface.command
-        # 尝试替换为守护模式
-        # 常见模式：--mode {mode} → --mode daemon
-        daemon_cmd = template.replace("{mode}", "daemon")
-        daemon_cmd = daemon_cmd.replace("{goal}", "serve")
-        daemon_cmd = daemon_cmd.replace("{task}", "serve")
 
+        # 策略 1：无占位符则直接使用
+        if "{" not in template:
+            try:
+                return shlex.split(template)
+            except ValueError:
+                return template.split()
+
+        # 策略 2：尝试守护模式替换
+        daemon_cmd = template
+        if "{mode}" in template:
+            daemon_cmd = daemon_cmd.replace("{mode}", "daemon")
+        if "{goal}" in template:
+            daemon_cmd = daemon_cmd.replace("{goal}", "serve")
+        if "{task}" in template:
+            daemon_cmd = daemon_cmd.replace("{task}", "serve")
+        if "{project}" in template:
+            daemon_cmd = daemon_cmd.replace("{project}", "")
+
+        # 策略 3：清理残留占位符并尝试
+        import re
+        daemon_cmd = re.sub(r"\{[^}]*\}", "", daemon_cmd).strip()
+
+        if daemon_cmd:
+            try:
+                return shlex.split(daemon_cmd)
+            except ValueError:
+                return daemon_cmd.split()
+
+        # 完全不支持的模板 — 至少返回可执行文件名
         try:
-            return shlex.split(daemon_cmd)
-        except ValueError:
-            return daemon_cmd.split()
+            first = shlex.split(template)[0]
+            return [first]
+        except Exception:
+            return ["echo", f"Agent {manifest.name} daemon command not configured"]
 
     async def _monitor_agent_process(
         self,

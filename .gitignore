@@ -30,3 +30,4 @@ models.yaml
 # OS
 Thumbs.db
 .DS_Store
+.smartbench/
