@@ -184,7 +184,7 @@ def _print_welcome_banner() -> None:
     model_store = ModelConfigStore()
     model_entries = model_store.list_all()
 
-    # 检查运行状态
+    # 检查运行状态（start 已执行 = Agent 已验证就绪）
     system_running = False
     try:
         from agent_hub.pid_store import PidFileStore
@@ -193,6 +193,12 @@ def _print_welcome_banner() -> None:
         system_running = len(existing) > 0
     except Exception:
         pass
+    # CLI Agent 按需调用，只要模型就绪即可工作
+    if not system_running:
+        from agent_hub.model_config import check_system_ready
+        llm_ok, _ = check_system_ready()
+        # 有模型 + 有 Agent = 可工作
+        system_running = llm_ok and len(agents_dict) > 1
 
     # ── Header ──
     console.print()
@@ -238,29 +244,20 @@ def _print_welcome_banner() -> None:
 
     console.print(table)
 
-    # ── 就绪检查 ──
-    from agent_hub.model_config import check_system_ready
-    llm_ready, llm_msg = check_system_ready()
-
     # ── 上下文提示 ──
-    if not llm_ready:
+    if not model_entries:
+        tip = "[red]⚠ 尚未配置模型。输入 [bold]models add[/bold] 进入引导式配置[/red]"
+    elif not llm_ready:
         tip = f"[red]⚠ {llm_msg}[/red]"
     elif not agents_dict or len(agents_dict) <= 1:
         tip = (
             "[yellow]💡 提示:[/yellow] "
-            "使用 [bold]agent register[/bold] 注册专业 Agent，"
-            "或 [bold]models add[/bold] 添加更多模型"
-        )
-    elif not system_running:
-        tip = (
-            "[yellow]💡 已就绪:[/yellow] "
-            "输入 [bold]start[/bold] 启动 Agent 系统，"
-            "或直接输入任务描述开始工作"
+            "使用 [bold]agent register[/bold] 注册专业 Agent"
         )
     else:
         tip = (
-            "[yellow]💡 系统运行中:[/yellow] "
-            "直接输入任务描述，或 [bold]stop[/bold] 停止系统"
+            "[yellow]💡 已就绪:[/yellow] "
+            "直接输入任务描述开始工作，[bold]start[/bold] 验证系统状态"
         )
     console.print(f"\n{tip}")
     console.print()
@@ -345,9 +342,14 @@ def main(ctx):
     help="只启动指定 Agent（逗号分隔），默认启动全部",
 )
 def start(agents: str | None):
-    """启动 Agent-hub + 自动拉起所有注册的专业 Agent。"""
-    registry_dir = _resolve_registry_dir()
+    """启动 Agent 系统 — 验证所有 Agent 就绪并显示状态。
 
+    检查每个 Agent 的 CLI 工具是否可用，显示就绪状态。
+    Agent 在 run 时按需调用，不需要常驻后台进程。
+    """
+    import shutil
+
+    registry_dir = _resolve_registry_dir()
     if not registry_dir.is_dir():
         console.print(f"[red]✗ 注册目录不存在: {registry_dir}[/red]")
         console.print("[dim]请先使用 'agent register' 注册 Agent[/dim]")
@@ -359,10 +361,6 @@ def start(agents: str | None):
         console.print(f"[dim]请在 {registry_dir}/ 中添加注册文件[/dim]")
         return
 
-    console.print(f"[dim]发现 {len(agents_dict)} 个 Agent:[/dim]")
-    for name, manifest in agents_dict.items():
-        console.print(f"  • {name}: {manifest.display_name}")
-
     # 过滤 Agent
     if agents:
         agent_names = set(a.strip() for a in agents.split(","))
@@ -371,84 +369,94 @@ def start(agents: str | None):
             console.print(f"[red]✗ 指定的 Agent 未找到: {agents}[/red]")
             return
 
-    async def _start():
-        from agent_hub.dashboard import HealthDashboard
-        from agent_hub.pid_store import PidFileStore
+    # 分离 internal 和外部 Agent
+    internal_agents = {n: m for n, m in agents_dict.items() if m.protocol == "internal"}
+    external_agents = {n: m for n, m in agents_dict.items() if m.protocol != "internal"}
 
-        bridge = CLIBridge()
-        pid_store = PidFileStore()
+    # ── 验证每个外部 Agent ──
+    results: list[dict] = []
 
-        # 跳过 internal 协议的 Agent（Agent-hub 自身不需要作为进程启动）
-        external_agents = {
-            name: m for name, m in agents_dict.items()
-            if m.protocol != "internal"
-        }
+    for name, manifest in sorted(external_agents.items()):
+        # 提取可执行文件名（去掉 cd 前缀和参数）
+        import shlex as _shlex
+        raw_cmd = manifest.interface.command
+        try:
+            cmd_parts = _shlex.split(raw_cmd)
+        except ValueError:
+            cmd_parts = raw_cmd.split()
 
-        if not external_agents:
-            console.print("[yellow]⚠ 没有需要通过子进程启动的外部 Agent[/yellow]")
-            console.print("[dim]internal 协议的 Agent（如 agent-hub）在进程内运行，无需额外启动[/dim]")
-            return
+        # 跳过 cd <path> && 前缀
+        if len(cmd_parts) >= 3 and cmd_parts[0] == "cd" and cmd_parts[2] in ("&&", ";"):
+            exe = cmd_parts[3] if len(cmd_parts) > 3 else "unknown"
+        else:
+            exe = cmd_parts[0] if cmd_parts else "unknown"
 
-        # 创建健康监控仪表盘
-        dash = HealthDashboard(console, external_agents, title="Agent Hub — Health Monitor")
+        # 检查可执行文件是否存在
+        exe_path = shutil.which(exe) or (Path(exe).exists() if exe else False)
+        status = "✅ 就绪" if exe_path else "❌ 未找到"
+        if not exe_path and exe == "unknown":
+            status = "⚠ 需配置"
 
-        with dash.run():
-            dash.log_event("正在启动 Agent...")
-            dash.refresh()
+        results.append({
+            "name": name,
+            "display": manifest.display_name,
+            "exe": exe,
+            "ready": bool(exe_path),
+            "status": status,
+            "tasks": len(manifest.capabilities.tasks),
+            "command": manifest.interface.command[:60],
+        })
 
-            manifest_list = list(external_agents.values())
-            results = await bridge.start_all(manifest_list)
+    # ── 渲染结果 ──
+    console.print()
+    console.rule("[bold white]🚀 Agent 系统启动[/bold white]")
+    console.print()
 
-            success_count = sum(1 for r in results.values() if r.status == "running")
+    table = Table(title="Agent 就绪状态")
+    table.add_column("Agent", style="cyan bold")
+    table.add_column("显示名")
+    table.add_column("可执行文件", style="dim")
+    table.add_column("状态")
+    table.add_column("任务数")
 
-            # 更新仪表盘 + 持久化 PID
-            for name, info in results.items():
-                dash.update_agent(name, info.status, info.pid)
-                if info.is_running:
-                    pid_store.save(
-                        name, info.pid,
-                        protocol=info.manifest.protocol if info.manifest else "cli",
-                    )
-                dash.log_event(
-                    f"{name}: {'🟢 started' if info.is_running else '🔴 failed'} "
-                    f"(pid={info.pid})"
-                )
+    for r in results:
+        status_style = "green" if r["ready"] else "red"
+        table.add_row(
+            f"{_agent_icon(r['name'])} {r['name']}",
+            r["display"],
+            r["exe"],
+            f"[{status_style}]{r['status']}[/{status_style}]",
+            str(r["tasks"]),
+        )
 
-            dash.log_event(f"启动完成: {success_count}/{len(results)} 个 Agent 运行中")
-            dash.refresh()
+    console.print(table)
 
-            if success_count == 0:
-                dash.log_event("警告: 所有 Agent 启动失败")
+    # Internal agents
+    if internal_agents:
+        console.print()
+        console.print("[dim]内部 Agent（进程内运行，无需外部工具）:[/dim]")
+        for name, m in sorted(internal_agents.items()):
+            console.print(f"  {_agent_icon(name)} [green]{name}[/green] — {len(m.capabilities.tasks)} tasks [dim](internal)[/dim]")
 
-            # 健康检查循环（在仪表盘内运行）
-            try:
-                while True:
-                    for name in list(results.keys()):
-                        healthy = await bridge.health_check(name)
-                        info = bridge.registry.get(name)
-                        status = "running" if healthy else "failed"
-                        uptime = info.uptime_seconds if info else 0.0
+    # Summary
+    ready_count = sum(1 for r in results if r["ready"])
+    total = len(results)
+    console.print()
+    if ready_count == total and total > 0:
+        console.print(f"[green]✅ 全部 {total} 个 Agent 就绪！系统已启动。[/green]")
+        console.print("[dim]直接输入任务描述即可开始工作，或输入 help 查看命令[/dim]")
+    elif total > 0:
+        console.print(f"[yellow]⚠ {ready_count}/{total} 个 Agent 就绪。[/yellow]")
+        console.print("[dim]未就绪的 Agent 在执行任务时可能会失败[/dim]")
+        # 给出修复建议
+        failed = [r for r in results if not r["ready"]]
+        for f in failed:
+            console.print(f"  [red]• {f['name']}[/red]: 可执行文件 [bold]{f['exe']}[/bold] 未找到")
+            console.print(f"    [dim]请确保已安装并加入 PATH，或更新 agent.yaml 中的 interface.command[/dim]")
+    else:
+        console.print("[yellow]⚠ 没有外部 Agent。使用 agent register 注册专业 Agent。[/yellow]")
 
-                        dash.update_agent(name, status, info.pid if info else 0, uptime)
-
-                        if not healthy and results.get(name) and results[name].status == "running":
-                            dash.log_event(f"⚠ {name} 健康检查失败")
-
-                    dash.log_event("Health check ✓")
-                    dash.refresh()
-                    await asyncio.sleep(5)
-
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                dash.log_event("⏸ 正在停止所有 Agent...")
-                dash.refresh()
-                await bridge.stop_all()
-                # 清理 PID 文件
-                for name in results:
-                    pid_store.remove(name)
-                dash.log_event("✅ 所有 Agent 已停止")
-                dash.refresh()
-
-    asyncio.run(_start())
+    console.print()
 
 
 @main.command()
