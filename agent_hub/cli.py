@@ -153,8 +153,7 @@ def _start_repl() -> None:
             # 使用 main.main(args, standalone_mode=False) 而非 CliRunner
             # CliRunner 隔离 stdin，导致 RichPrompt.ask() 无法读取输入
             try:
-                with console.status("[dim]...[/dim]"):
-                    main.main(args=args, standalone_mode=False)
+                main.main(args=args, standalone_mode=False)
             except SystemExit:
                 # Click 命令内部 sys.exit(1) 不杀死 REPL
                 continue
