@@ -264,10 +264,12 @@ class CLIBridge:
 
         try:
             # 启动子进程（不使用 shell，直接调用可执行文件）
+            # stdin=DEVNULL 防止子进程竞争终端输入（如 omniagent REPL 的 Prompt.ask()）
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
                 env=env,
                 cwd=cwd,
             )
@@ -570,6 +572,7 @@ class CLIBridge:
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
                 env=env,
                 cwd=cwd,
             )
