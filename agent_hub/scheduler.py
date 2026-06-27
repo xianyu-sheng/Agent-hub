@@ -419,34 +419,53 @@ class AgentScheduler:
         route_plan: RoutePlan,
         agents: dict[str, AgentManifest],
     ) -> SchedulerResult:
-        """无 UI 的纯命令行模式执行。"""
+        """流式输出模式 — Agent 输出实时滚动（类似 pip install）。"""
         task_results: list[TaskExecutionResult] = []
 
         waves = _compute_waves(route_plan.tasks)
 
-        for wave_idx, wave in enumerate(waves):
-            self.console.print(
-                f"[dim]Wave {wave_idx + 1}/{len(waves)}: "
-                f"{', '.join(f'[{t.agent}]{t.task}' for t in wave)}[/dim]"
+        # 流式回调：Agent 每行输出立即打印
+        def _make_stream_callback(agent_name: str):
+            color = {
+                "omniagent": "cyan", "resume-sync": "magenta",
+                "smartbench": "yellow", "agent-hub": "green",
+            }.get(agent_name, "white")
+            return lambda line: self.console.print(
+                f"[dim][{agent_name}][/dim] {line}"
             )
 
-            tasks_coros = [
-                self._execute_single_task(task, agents)
-                for task in wave
-            ]
+        for wave_idx, wave in enumerate(waves):
+            if len(waves) > 1:
+                self.console.print(
+                    f"[dim]── Wave {wave_idx + 1}/{len(waves)} ──[/dim]"
+                )
+
+            # 构建任务协程：外部 Agent 带流式回调，内部 Agent 走原路径
+            tasks_coros = []
+            for task in wave:
+                manifest = agents.get(task.agent)
+                if manifest and manifest.protocol != "internal":
+                    callback = _make_stream_callback(task.agent)
+                    tasks_coros.append(
+                        self._execute_single_task_streaming(task, agents, callback)
+                    )
+                else:
+                    tasks_coros.append(
+                        self._execute_single_task(task, agents, dash=None)
+                    )
+
             results = await asyncio.gather(*tasks_coros, return_exceptions=True)
 
             for task, result in zip(wave, results):
                 if isinstance(result, Exception):
                     exec_result = TaskExecutionResult(task=task, success=False, error=str(result))
-                    self.console.print(f"  [red]✗[/red] [{task.agent}] {task.task}: {result}")
+                    self.console.print(f"  [red]✗ [{task.agent}] {task.task}[/red]: {result}")
                 else:
                     exec_result = result
-                    status = "✓" if result.success else "✗"
-                    color = "green" if result.success else "red"
+                    icon = "✅" if result.success else "❌"
                     self.console.print(
-                        f"  [{color}]{status}[/{color}] [{task.agent}] {task.task} "
-                        f"({exec_result.duration_ms:.0f}ms)"
+                        f"  {icon} [{task.agent}] {task.task} "
+                        f"([dim]{exec_result.duration_ms:.0f}ms[/dim])"
                     )
 
                 task_results.append(exec_result)
@@ -458,6 +477,34 @@ class AgentScheduler:
             route_plan=route_plan,
             task_results=task_results,
             aggregate=aggregate,
+        )
+
+    async def _execute_single_task_streaming(
+        self,
+        task: RoutedTask,
+        agents: dict[str, AgentManifest],
+        on_stdout: Any = None,
+    ) -> TaskExecutionResult:
+        """执行单个任务并流式输出 stdout（用于 headless 模式）。"""
+        manifest = agents.get(task.agent)
+        if not manifest:
+            return TaskExecutionResult(task=task, success=False, error=f"Agent '{task.agent}' 未注册")
+
+        if manifest.protocol == "internal":
+            return await self._run_internal_task(task, manifest)
+
+        result = await self.bridge.execute(
+            manifest=manifest,
+            task_name=task.task,
+            params=task.params,
+            on_stdout=on_stdout,
+        )
+        return TaskExecutionResult(
+            task=task,
+            success=result.success,
+            output=result.output,
+            error=result.error,
+            duration_ms=result.duration_ms,
         )
 
     # ── 汇总 ────────────────────────────────────────────────────────

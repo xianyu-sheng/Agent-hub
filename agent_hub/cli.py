@@ -290,8 +290,8 @@ def _repl_help() -> None:
         ("  status", "刷新系统概览"),
         ("", ""),
         ("[bold cyan]任务执行[/bold cyan]", ""),
-        ("  run <任务>", "执行多 Agent 任务（自然语言）"),
-        ("  run", "进入交互式任务模式"),
+        ("  run <任务>", "执行多 Agent 任务（流式输出，默认）"),
+        ("  run -d <任务>", "执行任务（多面板 TUI 仪表盘）"),
         ("", ""),
         ("[bold cyan]其他[/bold cyan]", ""),
         ("  help / ?", "显示此帮助"),
@@ -1271,15 +1271,18 @@ def models_priority(set_priority: str | None):
 
 @main.command()
 @click.argument("task", required=False)
-@click.option("--no-dashboard", "-n", is_flag=True, help="不显示仪表盘（纯命令行模式）")
+@click.option("--dashboard", "-d", is_flag=True, help="显示多面板 TUI 仪表盘（默认流式输出）")
 @click.option("--timeout", "-t", default=300, help="每个 Agent 任务的超时秒数")
-def run(task: str | None, no_dashboard: bool, timeout: int):
+def run(task: str | None, dashboard: bool, timeout: int):
     """执行多 Agent 任务。
 
     TASK: 自然语言任务描述（如 "分析 omniagent 代码质量并更新简历"）
+
+    \b
+    默认以流式模式输出（类似 pip install），Agent 输出实时滚动。
+    使用 --dashboard / -d 切换到多面板 TUI 仪表盘。
     """
     if not task:
-        # 交互模式
         console.print("[bold cyan]Agent Hub — 交互模式[/bold cyan]")
         console.print("[dim]输入任务描述，或 'quit' 退出[/dim]")
         while True:
@@ -1287,17 +1290,16 @@ def run(task: str | None, no_dashboard: bool, timeout: int):
             if task.lower() in ("quit", "exit", "q"):
                 break
             if task.strip():
-                _run_task(task, no_dashboard, timeout)
+                _run_task(task, dashboard, timeout)
     else:
-        _run_task(task, no_dashboard, timeout)
+        _run_task(task, dashboard, timeout)
 
 
-def _run_task(task: str, no_dashboard: bool, timeout: int):
+def _run_task(task: str, use_dashboard: bool, timeout: int):
     """执行单个任务。"""
     from agent_hub.model_config import check_system_ready
     from agent_hub.scheduler import AgentScheduler
 
-    # 前置检查：模型是否就绪
     ready, msg = check_system_ready()
     if not ready:
         console.print(f"[red]✗ {msg}[/red]")
@@ -1312,12 +1314,14 @@ def _run_task(task: str, no_dashboard: bool, timeout: int):
 
         result = await scheduler.execute(
             task,
-            show_dashboard=not no_dashboard,
+            show_dashboard=use_dashboard,
         )
 
         if result.route_plan.tasks:
-            console.print(f"\n[bold]📊 执行结果:[/bold]")
-            console.print(result.summary_str())
+            console.print(f"\n[bold]📊 {result.success_count}/{len(result.task_results)} 成功 · {result.total_duration_ms/1000:.1f}s[/bold]")
+            if result.aggregate:
+                console.print(f"\n[bold]📝 汇总:[/bold]")
+                console.print(result.aggregate[:800])
         else:
             console.print(f"\n[yellow]{result.route_plan.analysis}[/yellow]")
 
