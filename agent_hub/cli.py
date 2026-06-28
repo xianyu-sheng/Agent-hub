@@ -76,11 +76,31 @@ def _load_all_agents() -> dict[str, AgentManifest]:
 
 
 def _get_model_priority() -> list[str]:
-    """获取模型优先级列表。"""
-    return os.environ.get(
-        "AGENT_HUB_MODELS",
-        "deepseek-v4-pro,claude-sonnet-4-6",
-    ).split(",")
+    """获取模型优先级列表。
+
+    优先读取环境变量 AGENT_HUB_MODELS，否则从 models.yaml 读取 default 模型，
+    最后回退为 ["deepseek-v4-pro"]。
+    """
+    env_val = os.environ.get("AGENT_HUB_MODELS")
+    if env_val:
+        return [m.strip() for m in env_val.split(",") if m.strip()]
+
+    # 从 models.yaml 读取已配置的模型（仅返回 API Key 可解析的）
+    try:
+        from agent_hub.model_config import ModelConfigStore
+        store = ModelConfigStore()
+        priority = store.model_priority
+        # 过滤掉 API Key 不可解析的模型（避免无意义的失败尝试）
+        resolvable = [m for m in priority if store.resolve_api_key(m)]
+        if resolvable:
+            return resolvable
+        # 如果所有模型都没有可解析的 Key，仍返回列表以便报错
+        if priority:
+            return priority
+    except Exception:
+        pass
+
+    return ["deepseek-v4-pro"]
 
 
 def _start_repl() -> None:
@@ -1427,7 +1447,7 @@ def schedule_run(name: str | None):
     console.print(f"[dim]手动触发: {job.name} → {job.agent}.{job.task}...[/dim]")
 
     async def _run():
-        scheduler = AgentScheduler(model_priority=["deepseek-v4-pro"])
+        scheduler = AgentScheduler(model_priority=_get_model_priority())
         result = await scheduler._execute_cron_job(job)
         return result
 

@@ -437,6 +437,31 @@ class CLIBridge:
 
     # ── 命令构建 ─────────────────────────────────────────────────
 
+    # ── Goal 截断阈值 ──────────────────────────────────────────────
+    # CLI 参数（如 --concern "{goal}"）不应超过此长度，否则会导致 argparse
+    # 解析失败或 shell 参数溢出。典型失败：smartbench 的 --concern 收到
+    # 200+ 字任务描述时秒退（exit code 1，耗时 < 500ms）。
+    _MAX_GOAL_LENGTH = 120
+
+    @staticmethod
+    def _sanitize_goal(goal: str, max_len: int = 120) -> str:
+        """清理并截断 goal 字符串，使其适合作为 CLI 参数。
+
+        1. 移除换行符和多余空白
+        2. 截断到 max_len（在词边界处截断）
+        3. 移除可能导致 CLI 解析错误的特殊字符
+        """
+        # 合并空白，移除换行
+        cleaned = " ".join(goal.split())
+        # 移除 CLI 敏感字符（引号、反斜杠、管道符等）
+        for char in ['"', "'", '\\', '|', '&', ';', '$', '`', '!', '<', '>']:
+            cleaned = cleaned.replace(char, "")
+        if len(cleaned) <= max_len:
+            return cleaned
+        # 在词边界处截断
+        truncated = cleaned[:max_len].rsplit(" ", 1)[0]
+        return truncated
+
     def _build_command(
         self,
         manifest: AgentManifest,
@@ -447,13 +472,19 @@ class CLIBridge:
 
         支持的占位符：
         - {task} → 任务名
-        - {goal} → params["goal"]
+        - {goal} → params["goal"]（自动截断至 120 字符，防止 CLI 参数溢出）
         - {mode} → params["mode"] 或 "react"
         - {project} → params["project"] 或 ""
         - {params_json} → 完整 params 的 JSON 字符串
         """
         template = manifest.interface.command
-        goal = str(params.get("goal", params.get("task_description", "")))
+        raw_goal = str(params.get("goal", params.get("task_description", "")))
+        goal = self._sanitize_goal(raw_goal, self._MAX_GOAL_LENGTH)
+        if len(raw_goal) > self._MAX_GOAL_LENGTH:
+            logger.debug(
+                "Goal 从 %d 字符截断至 %d: %s...",
+                len(raw_goal), len(goal), goal[:80],
+            )
         mode = str(params.get("mode", "react"))
         project = str(params.get("project", params.get("project_path", "")))
 

@@ -362,10 +362,29 @@ class IntentRouter:
     async def _call_llm(self, messages: list[dict]) -> str:
         """调用 LLM，按 model_priority 尝试。"""
         from agent_hub.llm import chat_completion_from_config
+        from agent_hub.model_config import ModelConfigStore
 
-        last_error = None
+        store = ModelConfigStore()
         tried_models: list[str] = []
+        failures: list[str] = []
+
         for model_id in self.model_priority:
+            # 预检查：API Key 是否可解析
+            entry = store.get(model_id)
+            if entry and not entry.resolved_api_key:
+                failures.append(
+                    f"{model_id}: API Key 未设置 "
+                    f"(models.yaml 引用 {entry.api_key}，"
+                    f"但环境变量未配置)"
+                )
+                continue
+
+            if entry and not entry.api_base:
+                failures.append(
+                    f"{model_id}: API Base URL 未配置"
+                )
+                continue
+
             try:
                 result = await chat_completion_from_config(
                     model_id=model_id,
@@ -377,16 +396,23 @@ class IntentRouter:
                     return result
                 else:
                     tried_models.append(model_id)
+                    failures.append(
+                        f"{model_id}: API 返回空结果 "
+                        f"(检查 API Key 是否有效、网络是否可达 {entry.api_base if entry else 'unknown'})"
+                    )
             except Exception as e:
-                last_error = e
-                tried_models.append(f"{model_id}({e})")
+                tried_models.append(model_id)
+                failures.append(f"{model_id}: {e}")
                 continue
 
         if not tried_models:
             tried_models = list(self.model_priority)
+
+        failure_detail = "\n  ".join(failures) if failures else "无详细信息"
         raise RuntimeError(
-            f"所有模型 ({', '.join(tried_models)}) 调用失败。"
-            f"请检查: 1) models add 配置模型 2) API Key 已设置 3) 网络连接"
+            f"所有模型 ({', '.join(tried_models)}) 调用失败。\n"
+            f"  失败详情:\n  {failure_detail}\n"
+            f"  请检查: 1) models add 配置模型 2) API Key 已设置 3) 网络连接"
         )
 
     @staticmethod
