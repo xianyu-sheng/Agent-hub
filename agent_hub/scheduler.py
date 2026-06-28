@@ -1111,9 +1111,13 @@ class AgentScheduler:
         if not task_results:
             return "未执行任何任务。"
 
-        # 单任务直接返回
+        # 单任务快速路径：输出足够丰富时直接返回，避免不必要的 LLM 调用
         if len(task_results) == 1 and task_results[0].success:
-            return task_results[0].output
+            output = task_results[0].output
+            # 输出较短或为结构化列表（如 discover_capabilities）→ 走 LLM 增强
+            if len(output) > 500:
+                return output
+            # 短输出（如纯列表）→ 继续走 LLM 汇总以提供更有价值的回答
 
         # 构建汇总 prompt
         results_text = "\n\n".join(
@@ -1128,7 +1132,13 @@ class AgentScheduler:
                 "role": "system",
                 "content": (
                     "你是一个多 Agent 任务汇总专家。请根据各 Agent 的执行结果，"
-                    "给出最终的完整回答。整合所有输出，形成连贯的结论。用中文回答。"
+                    "给出最终完整、有深度的回答。\n\n"
+                    "要求：\n"
+                    "1. 整合所有 Agent 输出，形成连贯结论（而非简单罗列）\n"
+                    "2. 如果输出是结构化数据（如 Agent 列表），展开每个条目的能力说明\n"
+                    "3. 如果某个 Agent 失败，说明可能原因和替代方案\n"
+                    "4. 用中文回答，结构清晰（可用标题分段）\n"
+                    "5. 不要只说'完成了X个任务'——要说明完成了什么、结果是什么"
                 ),
             },
             {

@@ -448,19 +448,43 @@ class CLIBridge:
         """清理并截断 goal 字符串，使其适合作为 CLI 参数。
 
         1. 移除换行符和多余空白
-        2. 截断到 max_len（在词边界处截断）
-        3. 移除可能导致 CLI 解析错误的特殊字符
+        2. 移除 shell 命令注入字符（管道、后台、分隔符、命令替换等）
+        3. 保留反斜杠（Windows 路径如 D:\\OmniAgent_CLI 需要）
+        4. 保留引号（shlex.split 会正确处理）
+        5. 截断到 max_len（在词边界处截断）
         """
         # 合并空白，移除换行
         cleaned = " ".join(goal.split())
-        # 移除 CLI 敏感字符（引号、反斜杠、管道符等）
-        for char in ['"', "'", '\\', '|', '&', ';', '$', '`', '!', '<', '>']:
+        # 仅移除 shell 命令注入和 I/O 重定向字符
+        # 注意：必须保留反斜杠 (\\)——否则 Windows 路径 D:\\project 会变成 D:project
+        for char in ['|', '&', ';', '$', '`', '!', '<', '>']:
             cleaned = cleaned.replace(char, "")
         if len(cleaned) <= max_len:
             return cleaned
         # 在词边界处截断
         truncated = cleaned[:max_len].rsplit(" ", 1)[0]
         return truncated
+
+    @staticmethod
+    def _extract_project_path(text: str) -> str | None:
+        """从文本中提取项目路径。
+
+        支持 Windows 绝对路径（D:\\project）和 Unix 风格路径（/home/user/project）。
+        返回正斜杠格式的路径（兼容 Windows 和 Unix），或 None。
+        """
+        if not text:
+            return None
+        # Windows 绝对路径: C:\path\to\project 或 C:/path/to/project
+        m = re.search(r"([A-Za-z]:[\\/][^\s,，。；;]+)", text)
+        if m:
+            raw = m.group(1)
+            # 规范化为正斜杠
+            return raw.replace("\\", "/")
+        # Unix 绝对路径: /home/user/project (需要至少 2 层深度以避免误匹配)
+        m = re.search(r"(/[^\s,，。；;]{2,}(?:/[^\s,，。；;]+)+)", text)
+        if m:
+            return m.group(1)
+        return None
 
     def _build_command(
         self,
@@ -487,6 +511,18 @@ class CLIBridge:
             )
         mode = str(params.get("mode", "react"))
         project = str(params.get("project", params.get("project_path", "")))
+
+        # 从 goal 文本自动提取项目路径（覆盖 LLM 路由可能产生的损坏路径）
+        # 例如 LLM 输出的 "D:OmniAgent_CLI"（缺少斜杠）会被 raw_goal 中的正确路径覆盖
+        extracted = self._extract_project_path(raw_goal)
+        if extracted:
+            if project and project != extracted:
+                logger.debug(
+                    "覆盖路由提供的 project: %s → %s", project, extracted
+                )
+            project = extracted
+        elif not project:
+            project = ""
 
         command_str = template.replace("{task}", task_name)
         command_str = command_str.replace("{goal}", goal)
