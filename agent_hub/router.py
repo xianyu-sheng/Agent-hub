@@ -17,6 +17,56 @@ from agent_hub.manifest import AgentManifest
 
 logger = logging.getLogger(__name__)
 
+# ── 协作策略 ──────────────────────────────────────────────────────────
+
+
+class CollaborationStrategy:
+    """多 Agent 协作模式枚举。
+
+    每种策略定义了 Agent 之间如何交互、如何传递结果、何时退出。
+    Router（LLM）根据用户意图自动选择策略，用户也可以显式指定。
+    """
+
+    FAN_OUT = "fan_out"           # 并行分派 → 汇总（默认，现有的 DAG 模式）
+    PIPELINE = "pipeline"         # 严格串行链（DAG 中 depends_on 已支持）
+    DEBATE = "debate"             # A 提案 → B 批评 → A 修订 → 循环直到通过
+    REFLECTION = "reflection"     # 单 Agent 自循环：执行 → 自审 → 改进
+    PLAN_EXECUTE = "plan_execute" # 先规划分步 → 按步执行 → 失败则重规划
+    VOTE = "vote"                 # 同一问题发给多 Agent/模型 → 投票选最佳
+    HUMAN_IN_LOOP = "hitl"        # 关键步骤暂停，等待人类批准
+
+    # 所有可用策略
+    ALL = {FAN_OUT, PIPELINE, DEBATE, REFLECTION, PLAN_EXECUTE, VOTE, HUMAN_IN_LOOP}
+
+    # 循环策略（有 max_iterations 和 exit_condition）
+    LOOP_STRATEGIES = {DEBATE, REFLECTION}
+
+    # 需要人类交互的策略
+    INTERACTIVE_STRATEGIES = {HUMAN_IN_LOOP}
+
+    @classmethod
+    def is_valid(cls, strategy: str) -> bool:
+        return strategy in cls.ALL
+
+    @classmethod
+    def is_loop(cls, strategy: str) -> bool:
+        return strategy in cls.LOOP_STRATEGIES
+
+    @classmethod
+    def default_for(cls, user_input: str) -> str:
+        """根据用户输入关键词推断默认策略（LLM Router 会覆盖此默认值）。"""
+        text = user_input.lower()
+        if any(w in text for w in ("提升", "优化", "改进", "修复", "提高")):
+            return cls.DEBATE
+        if any(w in text for w in ("写", "创作", "生成", "撰写", "博客")):
+            return cls.REFLECTION
+        if any(w in text for w in ("部署", "推送", "发布", "上线")):
+            return cls.HUMAN_IN_LOOP
+        if any(w in text for w in ("评估", "决策", "对比", "安全审查")):
+            return cls.VOTE
+        return cls.FAN_OUT
+
+
 # ── 路由结果数据结构 ──────────────────────────────────────────────
 
 
@@ -61,12 +111,16 @@ class RoutedTask:
 
 @dataclass
 class RoutePlan:
-    """意图路由的完整结果 — 跨 Agent 的任务 DAG。"""
+    """意图路由的完整结果 — 跨 Agent 的任务 DAG + 协作策略。"""
 
     tasks: list[RoutedTask]
     analysis: str = ""  # 意图分析摘要
     is_parallel: bool = False  # 是否有可并行的任务
     confidence: float = 1.0  # 路由置信度 (0.0-1.0)，LLM 输出或规则回退估算
+    strategy: str = CollaborationStrategy.FAN_OUT  # 协作策略
+    max_iterations: int = 1  # 循环策略的最大轮次（debate/reflection）
+    exit_condition: str = ""  # 循环退出条件，如 "pass_rate > 0.9"
+    approval_gates: list[int] = field(default_factory=list)  # hitl: 需人类审批的 task ID
 
     # 低于此阈值时 CLI 会要求用户确认
     CONFIDENCE_WARN_THRESHOLD = 0.7
@@ -84,14 +138,46 @@ class RoutePlan:
         """是否为低置信度路由（需要用户确认）。"""
         return self.confidence < self.CONFIDENCE_WARN_THRESHOLD
 
+    @property
+    def is_loop_strategy(self) -> bool:
+        """是否为循环策略（需要迭代控制）。"""
+        return CollaborationStrategy.is_loop(self.strategy)
+
+    @property
+    def is_interactive(self) -> bool:
+        """是否需要人类交互。"""
+        return self.strategy in CollaborationStrategy.INTERACTIVE_STRATEGIES
+
+    @property
+    def strategy_label(self) -> str:
+        """策略的人类可读标签。"""
+        labels = {
+            CollaborationStrategy.FAN_OUT: "并行分派",
+            CollaborationStrategy.PIPELINE: "串行管线",
+            CollaborationStrategy.DEBATE: "辩论-修复循环",
+            CollaborationStrategy.REFLECTION: "自反思循环",
+            CollaborationStrategy.PLAN_EXECUTE: "先规划后执行",
+            CollaborationStrategy.VOTE: "多视角投票",
+            CollaborationStrategy.HUMAN_IN_LOOP: "人机协同",
+        }
+        return labels.get(self.strategy, self.strategy)
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "tasks": [t.to_dict() for t in self.tasks],
             "analysis": self.analysis,
             "is_parallel": self.is_parallel,
             "confidence": self.confidence,
+            "strategy": self.strategy,
             "agents_involved": self.agents_involved,
         }
+        if self.max_iterations > 1:
+            d["max_iterations"] = self.max_iterations
+        if self.exit_condition:
+            d["exit_condition"] = self.exit_condition
+        if self.approval_gates:
+            d["approval_gates"] = self.approval_gates
+        return d
 
 
 # ── Router ──────────────────────────────────────────────────────────
@@ -127,6 +213,10 @@ class IntentRouter:
 {{
   "analysis": "简要分析用户意图（1-2句话，中文）",
   "confidence": 0.85,
+  "strategy": "fan_out",
+  "max_iterations": 1,
+  "exit_condition": "",
+  "approval_gates": [],
   "tasks": [
     {{
       "id": 1,
@@ -156,8 +246,18 @@ class IntentRouter:
 4. **depends_on** 标注该步骤依赖的前序步骤 ID 列表（无依赖则 []）
 5. 可以独立执行的步骤标记为 depends_on: [] — 它们将被并行执行
 6. 如果一个 Agent 无法完成用户请求，在 analysis 中说明原因，返回空 tasks
-7. confidence 值为 0.0-1.0，表示你对该路由方案的信心。简单明确的任务（如"列出 agent"）给 0.9+，模糊或跨多个领域的任务给 0.6-0.8。当用户输入和所有 Agent 的任务描述都不太匹配时给 < 0.5
-8. 只输出 JSON，不要输出其他文本"""
+7. confidence 值为 0.0-1.0，表示你对该路由方案的信心
+8. **strategy** 必须是以下之一: fan_out, pipeline, debate, reflection, plan_execute, vote, hitl
+   - fan_out: 并行分派（默认，独立任务）
+   - debate: 两个 Agent 辩论循环（如诊断→修复→再诊断），需设 max_iterations 和 exit_condition
+   - reflection: 单 Agent 自反思循环（如写→自审→改进），需设 max_iterations
+   - plan_execute: 先规划后分步执行
+   - vote: 同一问题发多个 Agent/模型，投票选最佳
+   - hitl: 关键步骤需人类批准，approval_gates 列出需暂停的 task ID
+9. **max_iterations**: 循环策略的最大轮次（fan_out 和 pipeline 为 1）
+10. **exit_condition**: 循环退出条件，如 "score >= 90"、"pass_rate > 0.9"（非循环策略留空）
+11. **approval_gates**: 需要人类审批的 task ID 列表（仅 hitl 策略使用）
+12. 只输出 JSON，不要输出其他文本"""
 
     def __init__(
         self,
@@ -326,6 +426,24 @@ class IntentRouter:
         confidence = float(data.get("confidence", 0.7))
         confidence = max(0.0, min(1.0, confidence))  # 钳制在 [0, 1]
 
+        # 提取协作策略
+        strategy = str(data.get("strategy", CollaborationStrategy.FAN_OUT))
+        if not CollaborationStrategy.is_valid(strategy):
+            logger.warning("LLM 输出了未知策略 '%s'，回退到 fan_out", strategy)
+            strategy = CollaborationStrategy.FAN_OUT
+
+        max_iterations = int(data.get("max_iterations", 1))
+        max_iterations = max(1, min(10, max_iterations))  # 钳制在 [1, 10]
+
+        exit_condition = str(data.get("exit_condition", "")).strip()
+
+        # 提取审批关卡
+        approval_gates_raw = data.get("approval_gates", [])
+        approval_gates = [
+            int(g) for g in (approval_gates_raw if isinstance(approval_gates_raw, list) else [])
+            if isinstance(g, (int, float))
+        ]
+
         tasks = [RoutedTask.from_dict(t) for t in raw_tasks if isinstance(t, dict)]
 
         # 检测并行性
@@ -338,6 +456,10 @@ class IntentRouter:
             analysis=analysis,
             is_parallel=has_parallel,
             confidence=confidence,
+            strategy=strategy,
+            max_iterations=max_iterations,
+            exit_condition=exit_condition,
+            approval_gates=approval_gates,
         )
 
     # ── 验证与补充 ──────────────────────────────────────────────
