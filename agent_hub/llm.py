@@ -112,7 +112,11 @@ def _do_chat_completion(
     temperature: float,
     timeout: int,
 ) -> str | None:
-    """执行实际的 HTTP 请求（同步函数，供 asyncio.to_thread 调用）。"""
+    """执行实际的 HTTP 请求（同步函数，供 asyncio.to_thread 调用）。
+
+    支持 reasoning 模型（如 deepseek-v4-pro）：
+    当 content 为空但 reasoning_content 非空时，使用 reasoning_content 作为回退。
+    """
     url = f"{base_url.rstrip('/')}/v1/chat/completions"
 
     body = json.dumps({
@@ -135,8 +139,21 @@ def _do_chat_completion(
             choices = data.get("choices")
             if choices and len(choices) > 0:
                 msg = choices[0].get("message")
-                if msg and msg.get("content"):
-                    return msg["content"]
+                if msg:
+                    content = msg.get("content", "")
+                    if content and content.strip():
+                        return content
+                    # Reasoning 模型回退：content 为空时使用 reasoning_content
+                    reasoning = msg.get("reasoning_content", "")
+                    if reasoning and reasoning.strip():
+                        logger.debug(
+                            "LLM content 为空，使用 reasoning_content 回退 "
+                            "(len=%d, finish=%s, total_tokens=%d)",
+                            len(reasoning),
+                            choices[0].get("finish_reason", "unknown"),
+                            data.get("usage", {}).get("total_tokens", 0),
+                        )
+                        return reasoning
             # 检查是否有明确的错误信息
             if data.get("error"):
                 logger.warning("LLM API 返回错误: %s", data["error"])

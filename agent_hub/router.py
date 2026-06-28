@@ -17,6 +17,24 @@ from agent_hub.manifest import AgentManifest
 
 logger = logging.getLogger(__name__)
 
+
+# ── 路径修复工具 ────────────────────────────────────────────────────
+
+
+def _fix_windows_path(path: str) -> str:
+    """修复损坏的 Windows 路径（如 "D:project" → "D:/project"）。
+
+    LLM 路由输出可能丢失路径分隔符，导致 smartbench 等 Agent 无法访问目录。
+    此函数检测 drive-letter-only 模式并补齐斜杠。
+    """
+    import re
+    # 匹配 "X:something"（驱动器号+冒号+非斜杠/反斜杠字符）
+    m = re.match(r"^([A-Za-z]):([^\\/].*)", path)
+    if m:
+        return f"{m.group(1)}:/{m.group(2)}"
+    return path
+
+
 # ── 协作策略 ──────────────────────────────────────────────────────────
 
 
@@ -531,6 +549,17 @@ class IntentRouter:
             task_info = agent.get_task(task.task)
             if task_info and not task.params.get("goal") and task.description:
                 task.params["goal"] = task.description
+
+            # 修复损坏的 Windows 路径（LLM 可能输出 "D:project" 缺少斜杠）
+            project = task.params.get("project", task.params.get("project_path", ""))
+            if project and isinstance(project, str):
+                fixed = _fix_windows_path(project)
+                if fixed != project:
+                    logger.debug("修复损坏路径: %s → %s", project, fixed)
+                    if "project" in task.params:
+                        task.params["project"] = fixed
+                    if "project_path" in task.params:
+                        task.params["project_path"] = fixed
 
             valid_tasks.append(task)
             valid_ids.add(task.id)
