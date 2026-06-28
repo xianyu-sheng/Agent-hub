@@ -48,6 +48,19 @@ console = Console(force_terminal=True)
 # ── 辅助函数 ────────────────────────────────────────────────────────
 
 
+def _run_async(coro):
+    """安全运行异步协程，避免事件循环泄漏。
+
+    Python 3.11+ 使用 asyncio.Runner 上下文管理器，
+    旧版本回退到 asyncio.run()。
+    """
+    if hasattr(asyncio, "Runner"):
+        with asyncio.Runner() as runner:
+            return runner.run(coro)
+    else:
+        return asyncio.run(coro)
+
+
 def _resolve_registry_dir() -> Path:
     """解析 agents.d/ 注册目录路径。"""
     # 优先使用环境变量
@@ -460,7 +473,6 @@ def start(agents: str | None):
     with dash.run():
         dash.render()
         # 动画：逐个点亮 Agent 状态
-        import asyncio as _asyncio
         for i in range(len(dash_agents) + 1):
             # 分阶段更新显示进度
             dash.render()
@@ -492,7 +504,7 @@ def stop():
         count = await pid_store.stop_all()
         console.print(f"[green]✅ 已停止 {count} 个 Agent 进程[/green]")
 
-    asyncio.run(_stop())
+    _run_async(_stop())
 
 
 @main.command()
@@ -1410,7 +1422,6 @@ def schedule_run(name: str | None):
 
     NAME: 任务名称，不指定则交互式选择。
     """
-    import asyncio as _asyncio
     from agent_hub.cron import CronScheduler, CronRunRecord
     from agent_hub.scheduler import AgentScheduler
     from rich.prompt import Prompt as RichPrompt
@@ -1445,7 +1456,7 @@ def schedule_run(name: str | None):
         return result
 
     try:
-        result = _asyncio.run(_run())
+        result = _run_async(_run())
     except Exception as e:
         console.print(f"[red]✗ 执行失败: {e}[/red]")
         return
@@ -1564,7 +1575,7 @@ def _run_task(task: str, use_dashboard: bool, timeout: int):
         else:
             console.print(f"\n[yellow]{result.route_plan.analysis}[/yellow]")
 
-    asyncio.run(_exec())
+    _run_async(_exec())
 
 
 # ── 模板生成 ────────────────────────────────────────────────────────

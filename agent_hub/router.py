@@ -198,6 +198,55 @@ class RoutePlan:
         return d
 
 
+# ── JSON 提取工具 ──────────────────────────────────────────────────
+
+
+def _extract_json_block(text: str, key_hint: str | None = "tasks") -> str:
+    """从 LLM 原始输出中提取 JSON 块，支持多种格式。
+
+    按优先级尝试：
+    1. 完整 JSON 对象（第一个 { 到最后一个 }，保守）
+    2. 包含 key_hint 的 JSON 对象（非贪婪）
+    3. 第一个 { 到最后一个 }（回退）
+
+    Args:
+        text: LLM 原始输出文本
+        key_hint: 期望的键名，用于定位正确的 JSON 块
+
+    Returns:
+        提取的 JSON 字符串
+
+    Raises:
+        ValueError: 未找到有效 JSON
+    """
+    import re as _re
+
+    # 策略 1: 非贪婪匹配包含 key_hint 的 JSON 对象
+    if key_hint:
+        pattern = rf'\{{[^{{}}]*"{key_hint}"[^{{}}]*\}}'
+        match = _re.search(pattern, text)
+        if match:
+            return match.group(0)
+
+        # 策略 1b: 允许一层嵌套的匹配
+        pattern_nested = rf'\{{(?:[^{{}}]|"[^"]*")*"{key_hint}"(?:[^{{}}]|\{{[^{{}}]*\}})*\}}'
+        match = _re.search(pattern_nested, text, _re.DOTALL)
+        if match:
+            return match.group(0)
+
+    # 策略 2: 找第一个 { 和与其匹配的最后一个 }
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("文本中未找到 JSON 起始标记 '{'")
+
+    # 从末尾向前找第一个 }（忽略尾随空白、markdown 标记）
+    end = text.rfind("}")
+    if end == -1 or end <= start:
+        raise ValueError("文本中未找到有效的 JSON 结束标记 '}'")
+
+    return text[start:end + 1]
+
+
 # ── Router ──────────────────────────────────────────────────────────
 
 
@@ -452,26 +501,50 @@ class IntentRouter:
         # 尝试提取 JSON 块
         output = output.strip()
 
-        # 移除 markdown 代码块标记
-        if output.startswith("```"):
+        # 移除 markdown 代码块标记（支持任意位置的代码块）
+        import re as _re
+        # 策略 1: 提取 ```json ... ``` 块
+        md_match = _re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', output, _re.DOTALL)
+        if md_match:
+            output = md_match.group(1).strip()
+        elif output.startswith("```"):
+            # 策略 2: 首尾 ``` 包裹（兼容旧格式）
             lines = output.split("\n")
-            # 移除首行 ```json 和末行 ```
             if lines[0].startswith("```"):
                 lines = lines[1:]
-            if lines and lines[-1].startswith("```"):
+            if lines and lines[-1].strip().startswith("```"):
                 lines = lines[:-1]
             output = "\n".join(lines)
 
-        try:
-            data = json.loads(output)
-        except json.JSONDecodeError:
-            # 尝试查找 JSON 块
-            import re
-            match = re.search(r'\{[\s\S]*"tasks"[\s\S]*\}', output)
-            if match:
-                data = json.loads(match.group(0))
-            else:
-                raise ValueError(f"无法解析 LLM 输出为 JSON: {output[:200]}...")
+        # 多次尝试解析 JSON（从严格到宽松）
+        data = None
+        errors = []
+        for attempt_name, attempt_fn in [
+            ("strict", lambda: json.loads(output)),
+            ("strip_trailing_commas", lambda: json.loads(
+                _re.sub(r',\s*([}\]])', r'\1', output)
+            )),
+            ("extract_json_block", lambda: json.loads(
+                _extract_json_block(output)
+            )),
+            ("extract_any_json", lambda: json.loads(
+                _extract_json_block(output, key_hint=None)
+            )),
+        ]:
+            try:
+                data = attempt_fn()
+                if attempt_name != "strict":
+                    logger.info("LLM JSON 解析成功（策略: %s）", attempt_name)
+                break
+            except (json.JSONDecodeError, ValueError) as e:
+                errors.append(f"{attempt_name}: {e}")
+                continue
+
+        if data is None:
+            raise ValueError(
+                f"无法解析 LLM 输出为 JSON (尝试了 {len(errors)} 种策略): "
+                f"{'; '.join(errors[-2:])} | 原始输出前200字符: {output[:200]}"
+            )
 
         analysis = str(data.get("analysis", ""))
         raw_tasks = data.get("tasks", [])

@@ -996,7 +996,19 @@ class AgentScheduler:
                     self._execute_single_task_throttled(task, agents, dash)
                     for task in wave
                 ]
-                results = await asyncio.gather(*tasks_coros, return_exceptions=True)
+                # 波次超时 = 每个任务超时 + 30s 缓冲，防止子进程挂死导致调度器冻结
+                wave_timeout = max(self.default_timeout, len(wave) * 120) + 30
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*tasks_coros, return_exceptions=True),
+                        timeout=wave_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("波次 %d 超时 (%ds)，标记所有任务为失败", wave_idx + 1, wave_timeout)
+                    results = [
+                        TimeoutError(f"波次超时 ({wave_timeout}s)")
+                        for _ in wave
+                    ]
 
                 # 本轮波次结果（用于下一波次上下文注入）
                 wave_results: list[TaskExecutionResult] = []
@@ -1108,7 +1120,10 @@ class AgentScheduler:
                 else:
                     tasks_coros.append(_throttled_internal(task))
 
-            results = await asyncio.gather(*tasks_coros, return_exceptions=True)
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks_coros, return_exceptions=True),
+                timeout=max(self.default_timeout, len(wave) * 120) + 30,
+            )
 
             wave_results: list[TaskExecutionResult] = []
             for task, result in zip(wave, results):

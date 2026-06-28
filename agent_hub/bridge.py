@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -584,6 +585,10 @@ class CLIBridge:
         )
 
         # 简单的 shell 分词（支持引号）
+        # Windows 路径安全：shlex.split 将反斜杠视为转义字符，
+        # 会将 D:\Agent-hub 拆成 D:Agent-hub。在 POSIX 平台上提前归一化。
+        if sys.platform == "win32":
+            command_str = command_str.replace("\\", "/")
         try:
             return shlex.split(command_str)
         except ValueError:
