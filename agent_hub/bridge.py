@@ -761,6 +761,8 @@ class CLIBridge:
             info.desired_state = "running"  # Watchdog: 标记用户期望此 Agent 保持运行
             info.restart_count = 0           # 手动启动 → 重置重启计数
             info.last_restart_time = time.monotonic()
+            # 保存 stdout 回调，供 Watchdog 自动重启时复用
+            self._watchdog_stdout_cb = on_stdout
             logger.info("Agent %s 启动成功 (pid=%d)", name, process.pid)
             return info
 

@@ -217,6 +217,8 @@ class AgentScheduler:
         self.console = console or Console(force_terminal=True)
         self.max_concurrent = max_concurrent
         self.default_timeout = default_timeout
+        # 并发节流信号量 — 防止 Wave 内同时生成过多子进程耗尽系统资源
+        self._concurrency_sem = asyncio.Semaphore(max_concurrent)
 
         # 子模块（延迟初始化）
         self._router: IntentRouter | None = None
@@ -671,6 +673,14 @@ class AgentScheduler:
                     )
                     if best:
                         self.console.print(f"    [green]✅ 最佳答案已生成[/green]")
+                        # 将最佳答案注入结果列表，供 aggregate 使用
+                        best_task = RoutedTask(
+                            id=999, agent="llm-comparator", task="compare_models",
+                            description="多模型投票比较最佳答案",
+                        )
+                        all_results.append(TaskExecutionResult(
+                            task=best_task, success=True, output=best,
+                        ))
                 except Exception:
                     best = None
 
@@ -989,7 +999,7 @@ class AgentScheduler:
 
                 # 并行执行波内任务（统一分派：内部/外部）
                 tasks_coros = [
-                    self._execute_single_task(task, agents, dash)
+                    self._execute_single_task_throttled(task, agents, dash)
                     for task in wave
                 ]
                 results = await asyncio.gather(*tasks_coros, return_exceptions=True)
@@ -1086,18 +1096,23 @@ class AgentScheduler:
                     task.params["_pipeline_context"] = ctx
 
             # 构建任务协程：外部 Agent 带流式回调，内部 Agent 走原路径
+            # 所有任务受 max_concurrent Semaphore 节流
+            async def _throttled_internal(task):
+                async with self._concurrency_sem:
+                    return await self._execute_single_task(task, agents, dash=None)
+
+            async def _throttled_streaming(task, cb):
+                async with self._concurrency_sem:
+                    return await self._execute_single_task_streaming(task, agents, cb)
+
             tasks_coros = []
             for task in wave:
                 manifest = agents.get(task.agent)
                 if manifest and manifest.protocol != "internal":
                     callback = _make_stream_callback(task.agent)
-                    tasks_coros.append(
-                        self._execute_single_task_streaming(task, agents, callback)
-                    )
+                    tasks_coros.append(_throttled_streaming(task, callback))
                 else:
-                    tasks_coros.append(
-                        self._execute_single_task(task, agents, dash=None)
-                    )
+                    tasks_coros.append(_throttled_internal(task))
 
             results = await asyncio.gather(*tasks_coros, return_exceptions=True)
 
@@ -1266,6 +1281,19 @@ class AgentScheduler:
         return TaskExecutionResult(
             task=task,
             success=result.success,
+
+    async def _execute_single_task_throttled(
+        self,
+        task: RoutedTask,
+        agents: dict[str, AgentManifest],
+        dash: AgentDashboard | None = None,
+    ) -> TaskExecutionResult:
+        """与 _execute_single_task 相同，但受 max_concurrent Semaphore 节流。
+
+        防止 Wave 内同时生成过多子进程耗尽系统资源（文件描述符、内存）。
+        """
+        async with self._concurrency_sem:
+            return await self._execute_single_task(task, agents, dash)
             output=result.output,
             error=result.error,
             duration_ms=result.duration_ms,
