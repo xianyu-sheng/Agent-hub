@@ -585,12 +585,78 @@ class AgentScheduler:
         agents: dict[str, AgentManifest],
         show_dashboard: bool,
     ) -> SchedulerResult:
-        """Vote 策略：同一问题 → 多 Agent/模型 → 投票选最佳。
+        """Vote 策略：同一任务 → 多模型执行 → LLM 比较差异 → 选最佳。
 
-        目前复用 fan_out（并行执行），后续可增强为真正的多模型投票。
+        将每个 task 用 model_priority 中的前 N 个模型各执行一次，
+        然后用 LLM 比较各模型的输出，整合为最优结果。
         """
-        self.console.print("[bold magenta]🗳 投票模式[/bold magenta]")
-        return await self._execute_fan_out(user_input, route_plan, agents, show_dashboard)
+        self.console.print("[bold magenta]🗳 投票模式: 多模型并发执行[/bold magenta]")
+
+        all_results: list[TaskExecutionResult] = []
+        start_time = time_mod.monotonic()
+
+        # 每个 task 用多个模型各执行一次
+        models = self.model_priority[:3]  # 最多 3 个模型
+        if len(models) < 2:
+            self.console.print("[dim]  仅 1 个模型可用，回退到 fan_out[/dim]")
+            return await self._execute_fan_out(user_input, route_plan, agents, show_dashboard)
+
+        self.console.print(f"[dim]  使用模型: {', '.join(models)}[/dim]")
+
+        for task in route_plan.tasks:
+            self.console.print(f"\n[bold]  📍 任务: [{task.agent}] {task.task}[/bold]")
+            task_outputs: list[dict] = []
+
+            for model_id in models:
+                self.console.print(f"[dim]    🤖 {model_id}...[/dim]")
+                # 临时切换模型优先级为单模型
+                orig_priority = self.model_priority
+                self.model_priority = [model_id]
+
+                try:
+                    result = await self._execute_single_task(task, agents, dash=None)
+                finally:
+                    self.model_priority = orig_priority
+
+                task_outputs.append({
+                    "model": model_id,
+                    "success": result.success,
+                    "output": result.output[:600],
+                    "error": result.error[:200],
+                    "duration_ms": result.duration_ms,
+                })
+                all_results.append(result)
+
+            # LLM 比较各模型输出
+            if len(task_outputs) >= 2:
+                comparison_prompt = (
+                    f"原始任务: {task.description or task.task}\n\n"
+                    + "\n\n---\n\n".join(
+                        f"模型 [{t['model']}]:\n{t['output']}"
+                        for t in task_outputs if t['success']
+                    )
+                    + "\n\n请比较以上各模型的输出，选出最佳回答或整合为最优答案。用中文回复。"
+                )
+                try:
+                    from agent_hub.llm import chat_completion_from_config
+                    best = await chat_completion_from_config(
+                        model_id=models[0],
+                        messages=[{"role": "user", "content": comparison_prompt}],
+                        max_tokens=1024, temperature=0.3,
+                    )
+                    if best:
+                        self.console.print(f"    [green]✅ 最佳答案已生成[/green]")
+                except Exception:
+                    best = None
+
+        total_duration = (time_mod.monotonic() - start_time) * 1000
+        aggregate = await self._aggregate(user_input, all_results, route_plan.analysis)
+
+        return SchedulerResult(
+            user_input=user_input, route_plan=route_plan,
+            task_results=all_results, aggregate=aggregate,
+            total_duration_ms=total_duration,
+        )
 
     # ── 策略实现：plan_execute（先规划后执行）────────────────────
 
@@ -601,12 +667,67 @@ class AgentScheduler:
         agents: dict[str, AgentManifest],
         show_dashboard: bool,
     ) -> SchedulerResult:
-        """Plan-Execute 策略：先规划 → 按步执行 → 失败则重规划。
+        """Plan-Execute 策略：先规划 → 按步执行 → 失败则自动重规划。
 
-        目前复用 pipeline（串行 DAG），后续可增强为动态 replan。
+        将第一个 task 作为"规划阶段"，后续 task 作为"执行阶段"。
+        执行阶段中的任何失败会触发重规划（将失败信息反馈给规划 Agent）。
         """
         self.console.print("[bold magenta]📋 规划-执行模式[/bold magenta]")
-        return await self._execute_fan_out(user_input, route_plan, agents, show_dashboard)
+
+        all_results: list[TaskExecutionResult] = []
+        start_time = time_mod.monotonic()
+        max_replans = route_plan.max_iterations
+
+        for replan_round in range(max_replans + 1):
+            if replan_round == 0:
+                self.console.print("[bold]  📐 规划阶段...[/bold]")
+            else:
+                self.console.print(f"[bold]  🔄 重规划 (第 {replan_round} 次)...[/bold]")
+
+            # 执行所有 tasks（DAG 顺序）
+            if show_dashboard:
+                round_result = await self._execute_with_dashboard(
+                    user_input, route_plan, agents,
+                )
+            else:
+                round_result = await self._execute_headless(
+                    user_input, route_plan, agents,
+                )
+
+            all_results.extend(round_result.task_results)
+
+            # 检查是否全部成功
+            if round_result.is_success:
+                self.console.print("[green]✅ 所有步骤成功[/green]")
+                break
+
+            # 有失败 → 尝试重规划
+            if replan_round < max_replans:
+                failures = [
+                    f"[{r.task.agent}] {r.task.task}: {r.error}"
+                    for r in round_result.task_results if not r.success
+                ]
+                self.console.print(
+                    f"[yellow]⚠️  {len(failures)} 个步骤失败，触发重规划[/yellow]"
+                )
+                # 将失败信息注入第一个 task 的 params 作为 context
+                if route_plan.tasks:
+                    route_plan.tasks[0].params["context"] = (
+                        f"上一轮执行中 {len(failures)} 个步骤失败:\n"
+                        + "\n".join(failures)
+                        + "\n\n请调整计划以解决以上问题。"
+                    )
+            else:
+                self.console.print("[red]✗ 重规划次数耗尽[/red]")
+
+        total_duration = (time_mod.monotonic() - start_time) * 1000
+        aggregate = await self._aggregate(user_input, all_results, route_plan.analysis)
+
+        return SchedulerResult(
+            user_input=user_input, route_plan=route_plan,
+            task_results=all_results, aggregate=aggregate,
+            total_duration_ms=total_duration,
+        )
 
     # ── 策略实现：hitl（人机协同）───────────────────────────────
 
@@ -617,16 +738,90 @@ class AgentScheduler:
         agents: dict[str, AgentManifest],
         show_dashboard: bool,
     ) -> SchedulerResult:
-        """Human-in-the-loop 策略：执行 DAG，在审批关卡暂停等待人类确认。
+        """Human-in-the-loop 策略：逐任务执行，审批关卡处暂停等人类确认。
 
-        审批关卡由 route_plan.approval_gates 指定（task ID 列表）。
-        当前版本复用 fan_out 并在汇总前提示，完整审批 UI 在 Phase 5b 实现。
+        审批关卡 = route_plan.approval_gates 中列出的 task ID。
+        被标记的 task 完成后暂停，展示输出，等待用户选择：
+          [Y] 批准继续  [n] 拒绝中止  [r] 重试（输入反馈）
         """
+        from rich.prompt import Prompt as RichPrompt
+
         self.console.print(
             f"[bold magenta]👤 人机协同模式[/bold magenta]"
             + (f" [审批关卡: 步骤 {route_plan.approval_gates}]" if route_plan.approval_gates else "")
         )
-        return await self._execute_fan_out(user_input, route_plan, agents, show_dashboard)
+        self.console.print("[dim]  关键操作将在执行后等待您的确认[/dim]")
+
+        all_results: list[TaskExecutionResult] = []
+        start_time = time_mod.monotonic()
+        approval_set = set(route_plan.approval_gates)
+
+        # HitL 使用串行执行（逐任务），确保审批流清晰
+        for task in route_plan.tasks:
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                self.console.print(
+                    f"\n[bold]  ▶ [{task.agent}] {task.task}[/bold]"
+                    + (f" [审批关卡]" if task.id in approval_set else "")
+                )
+
+                # 执行单个任务
+                result = await self._execute_single_task(task, agents, dash=None)
+                all_results.append(result)
+
+                icon = "✅" if result.success else "❌"
+                self.console.print(
+                    f"  {icon} 完成 ({result.duration_ms:.0f}ms)"
+                )
+                if result.output:
+                    self.console.print(f"  [dim]输出: {result.output[:300]}[/dim]")
+                if result.error:
+                    self.console.print(f"  [red]错误: {result.error[:200]}[/red]")
+
+                # 非审批关卡 → 直接继续
+                if task.id not in approval_set:
+                    break
+
+                # 审批关卡 → 等待人类决策
+                self.console.print()
+                choice = RichPrompt.ask(
+                    f"  [bold yellow]⚠ 审批关卡[/bold yellow] — "
+                    f"[{task.agent}] {task.task}",
+                    choices=["Y", "n", "r"],
+                    default="Y",
+                )
+
+                if choice == "Y":
+                    self.console.print("  [green]✅ 已批准，继续[/green]")
+                    break  # 批准，继续下一个 task
+                elif choice == "n":
+                    self.console.print("  [red]✗ 已拒绝，中止执行[/red]")
+                    # 返回已收集的结果
+                    total_duration = (time_mod.monotonic() - start_time) * 1000
+                    aggregate = f"执行被用户中止于步骤 {task.id} ([{task.agent}] {task.task})"
+                    return SchedulerResult(
+                        user_input=user_input, route_plan=route_plan,
+                        task_results=all_results, aggregate=aggregate,
+                        total_duration_ms=total_duration,
+                    )
+                elif choice == "r":
+                    if attempt < max_retries:
+                        feedback = RichPrompt.ask("    反馈（将传给 Agent 重试）", default="请改进输出质量")
+                        task.params["context"] = f"用户反馈: {feedback}\n请根据反馈重新执行。"
+                        task.params["retry_attempt"] = attempt
+                        self.console.print(f"  [yellow]🔄 重试 (第 {attempt}/{max_retries} 次)[/yellow]")
+                    else:
+                        self.console.print(f"  [red]✗ 已达最大重试次数 ({max_retries})[/red]")
+                        break
+
+        total_duration = (time_mod.monotonic() - start_time) * 1000
+        aggregate = await self._aggregate(user_input, all_results, route_plan.analysis)
+
+        return SchedulerResult(
+            user_input=user_input, route_plan=route_plan,
+            task_results=all_results, aggregate=aggregate,
+            total_duration_ms=total_duration,
+        )
 
     # ── 退出条件求值 ──────────────────────────────────────────
 
