@@ -1,537 +1,534 @@
-# 🚀 Agent Hub — 解耦的多 Agent 调度系统
+# Agent Hub
+
+> **Multi-Agent Orchestration System** — LLM intent routing, DAG scheduling, and 7 collaboration strategies.
 
 <p align="center">
-  <strong>直接输入自然语言，自动路由到专业 Agent 协同工作</strong>
-  <br>
-  <em>7 种协作策略 · 有记忆的调度系统 · 定时自主运行</em>
+  <a href="README_CN.md">📖 中文文档 → README_CN.md</a>
 </p>
 
-Agent Hub 是一个**解耦的多 Agent 中央调度系统**。通过 `agent.yaml` 自描述清单发现专业 Agent，利用 LLM 意图路由将用户自然语言任务分解为跨 Agent 的 DAG，根据**协作策略**（辩论/反思/投票/人机协同...）执行调度，并在终端中以 Rich TUI 仪表盘实时展示。
-
-**核心理念**：不是再做一个 Agent，而是设计一套让多个专业 Agent **协同工作**的系统——Agent Hub 是粘合剂，专业 Agent 是积木。
-
----
-
-## 🎯 快速体验
-
-```bash
-pip install -e .
-agent-hub                            # 进入交互式命令中心
-# 直接输入自然语言即可：
-agent-hub> 分析 agent-hub 代码质量并更新简历
-```
-
-**无需 `run` 前缀**，直接说人话。
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square&logo=python" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License MIT">
+  <img src="https://img.shields.io/badge/status-beta-yellow?style=flat-square" alt="Status Beta">
+  <img src="https://img.shields.io/badge/tests-30%20passed-brightgreen?style=flat-square" alt="Tests 30 Passed">
+  <img src="https://img.shields.io/badge/coverage-80%25-yellowgreen?style=flat-square" alt="Coverage 80%">
+</p>
 
 ---
 
-## 🧠 设计理念
+## Table of Contents
 
-### 三层解耦架构
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Layer 1: Agent Hub (orchestrator)                            │
-│  ┌──────────┐ ┌──────────┐ ┌───────────┐ ┌───────────────┐  │
-│  │ Prompt   │ │ DAG      │ │ Multi-Agent│ │ Visual        │  │
-│  │ Optimizer│ │ Scheduler│ │ Aggregator │ │ Dashboard     │  │
-│  │ (LLM)    │ │ (Kahn)   │ │ (LLM)      │ │ (Rich TUI)    │  │
-│  └──────────┘ └──────────┘ └───────────┘ └───────────────┘  │
-└─────────────────────┬────────────────────────────────────────┘
-                      │ Agent Manifest (agent.yaml)
-                      │ — 只读，永不修改
-        ┌─────────────┼─────────────┐
-        ▼             ▼             ▼
-┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-│  omniagent  │ │ resume-sync │ │  SmartBench │
-│  4 tasks    │ │  6 tasks    │ │  3 tasks    │
-│  CLI bridge │ │  CLI bridge │ │  CLI bridge │
-└─────────────┘ └─────────────┘ └─────────────┘
-```
-
-### 设计原则
-
-- **零侵入**：每个专业项目只新增一个 `agent.yaml`，不改任何代码
-- **交互式引导**：所有命令支持无参交互模式，逐步引导用户操作
-- **自然语言优先**：直接输入任务描述，无需记忆命令格式
-- **按需调用**：Agent 在 `run` 时通过子进程拉起，无需常驻后台
-- **智能兜底**：模型未配置/Key 未设置时给出精确的修复命令
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Design Principles](#design-principles)
+- [Features](#features)
+  - [Smart Routing](#smart-routing)
+  - [Session Memory](#session-memory)
+  - [Watchdog](#watchdog)
+  - [Cron Scheduler](#cron-scheduler)
+- [Collaboration Strategies](#collaboration-strategies)
+- [Quick Start](#quick-start)
+- [REPL Usage](#repl-usage)
+- [Command Reference](#command-reference)
+- [Agent Manifest Protocol](#agent-manifest-protocol)
+- [Readiness Check](#readiness-check)
+- [Testing](#testing)
+- [Project Map](#project-map)
+- [FAQ](#faq)
+- [License](#license)
 
 ---
 
-## 📸 界面展示
+## Overview
 
-### 交互式命令中心 (REPL)
+Agent Hub is a **decoupled central scheduler** for multi-agent orchestration. It discovers professional agents through lightweight `agent.yaml` manifest files, routes natural language requests into cross-agent DAGs, and executes them using 7 different collaboration strategies.
+
+The system follows a **zero-intrusion** philosophy — each existing project only needs to add a single `agent.yaml` file to become discoverable and callable by Agent Hub. No restructuring, no deep coupling.
 
 ```
-──────────────── 🔄 Agent Hub — 多 Agent 中央调度系统 ─────────────────
-v0.1.0 · 直接输入自然语言或命令 · help 查看帮助 · quit 退出
-
-                      📋 系统概览
-┌────────────────┬─────────────────────────────────────┐
-│ 已注册 Agent   │ 🔄 agent-hub ✅ (internal, 4 tasks) │
-│                │ 🔍 omniagent ✅ (cli, 4 tasks)      │
-│                │ 📄 resume-sync ✅ (cli, 6 tasks)    │
-│                │ 🧪 smartbench ✅ (cli, 3 tasks)     │
-│ 已配置模型     │ ⭐ deepseek-v4-pro (deepseek)       │
-│ 系统状态       │ 🟢 运行中                           │
-└────────────────┴─────────────────────────────────────┘
-💡 已就绪: 直接输入任务描述开始工作
-
-agent-hub > 分析 smartbench 代码质量并更新简历    ← 直接说人话
+┌─────────────────────────────────────────────────────────┐
+│                   Agent Hub (Orchestrator)               │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │
+│  │ Smart Router │─▶│ DAG Scheduler│─▶│ Strategy Exec. │  │
+│  └─────────────┘  └──────────────┘  └────────────────┘  │
+│         │                │                    │          │
+│    ┌────┴────┐     ┌────┴────┐         ┌─────┴─────┐   │
+│    │ Session │     │ Cron    │         │ Watchdog  │    │
+│    │ Memory  │     │ Sched.  │         │ Monitor   │    │
+│    └─────────┘     └─────────┘         └───────────┘   │
+└───────────────────────┬─────────────────────────────────┘
+                        │  agent.yaml (read-only)
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│  OmniAgent   │ │ Resume-Sync  │ │ SmartBench    │
+│  (CLI/MCP)   │ │  (CLI)       │ │  (CLI/MCP)   │
+│  Coding      │ │  Resume      │ │ Code Analysis │
+│  Assistant   │ │  Automation  │ │ & Debate     │
+└──────────────┘ └──────────────┘ └──────────────┘
 ```
 
-### 启动仪表盘 (Start TUI)
+---
+
+## Architecture
+
+### Three-Layer Decoupled Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│           Agent Hub — 多 Agent 中央调度系统                │
-├────────────────────┬─────────────────────────────────────┤
-│  🤖 Agent 状态      │  📊 系统信息                        │
-│  ● 🔍 omniagent    │  📦 模型: ⭐ deepseek-v4-pro        │
-│    ✅ 就绪          │  统计: 4 Agent · 3 外部 · 1 模型    │
-│  ● 📄 resume-sync  │                                     │
-│    ✅ 就绪          │  💡 直接输入任务描述即可工作         │
-│  ● 🧪 smartbench   │                                     │
-│    ✅ 就绪          │                                     │
-├────────────────────┴─────────────────────────────────────┤
-│  ✅ 全部 3 个 Agent 就绪！系统已启动                      │
+│                AGENT HUB (Orchestrator)                   │
+│  Central scheduler — intent routing, DAG building,       │
+│  strategy execution, session memory, watchdog, cron       │
+├──────────────────────────────────────────────────────────┤
+│                AGENT MANIFEST (agent.yaml)                │
+│  Read-only descriptor — each project adds ONE file        │
+│  name, description, capabilities, interface templates     │
+├──────────────────────────────────────────────────────────┤
+│             PROFESSIONAL AGENTS (Executors)               │
+│  omniagent │ resume-sync │ SmartBench │ ...              │
+│  (cli / internal / mcp / http protocols)                  │
 └──────────────────────────────────────────────────────────┘
 ```
 
+| Layer | Description |
+|---|---|
+| **Agent Hub** | Central orchestrator — handles intent recognition, routing, DAG scheduling, strategy execution, session memory, watchdog, and cron scheduling. No domain-specific logic. |
+| **Agent Manifest** | A single `agent.yaml` file per project, acting as a read-only descriptor. Contains the agent's name, description, capabilities, tasks, and interface call templates. |
+| **Professional Agents** | The actual domain-specific agents (e.g., omniagent for coding, resume-sync for resume automation, SmartBench for code analysis). Communicate via CLI, internal Python calls, MCP, or HTTP. |
+
 ---
 
-## 📦 安装
+## Design Principles
+
+| Principle | Description |
+|---|---|
+| **Zero-Intrusion** | Each existing project only needs to add one `agent.yaml` file. No code changes, no framework imports, no deep coupling. |
+| **Interactive Guidance** | When a user's intent is ambiguous, the system proactively asks clarifying questions rather than guessing or failing silently. |
+| **Natural-Language-First** | Users express their goals in natural language. The system understands, disambiguates, and translates into executable DAGs. |
+| **On-Demand Invocation** | Agents are only loaded and called when needed. No persistent connections or background polling. |
+| **Intelligent Fallback** | When routing confidence is low or an agent fails, the system degrades gracefully — fuzzy matching, rule-based fallbacks, and clear user-facing warnings. |
+
+---
+
+## Features
+
+### Smart Routing
+
+| Capability | Description |
+|---|---|
+| **Input Optimization** | Automatically rewrites and enriches user queries for better intent recognition. |
+| **Collaboration Strategy Inference** | Analyzes the task to determine which of the 7 collaboration strategies is most appropriate. |
+| **Routing Memory** | Caches routing decisions for repeated requests — skips LLM inference on identical inputs. |
+| **Confidence Gating** | If routing confidence is below 70%, the system shows a user warning and asks for confirmation. |
+| **Fuzzy Matching** | When exact intent matching fails, performs fuzzy matching against known agent capabilities. |
+| **Rule Fallback** | If LLM-based routing is unavailable, falls back to deterministic rule-based matching. |
+
+### Session Memory
+
+| Feature | Detail |
+|---|---|
+| Cross-turn context | Maintains conversation state across multiple exchanges. |
+| Last 3 rounds injected | Recent conversation history is injected into the routing prompt for context-aware decisions. |
+| Auto-cleanup | Automatically trims the conversation history to keep the last 50 rounds to manage context window. |
+
+### Watchdog
+
+- Monitors all running agent processes.
+- Auto-restarts crashed processes (max 3 restarts within 5 minutes).
+- If the restart limit is exceeded, marks the agent as **failed** and notifies the orchestrator.
+
+### Cron Scheduler
+
+- Pure Python cron engine — **zero external dependencies**.
+- Standard 5-field cron syntax (`minute hour day month weekday`).
+- Execution history is persisted to disk for audit and recovery.
+
+---
+
+## Collaboration Strategies
+
+Agent Hub supports 7 collaboration strategies for orchestrating multi-agent workflows:
+
+| # | Strategy | Pattern | Use Case |
+|---|----------|---------|----------|
+| 1 | **fan_out** | Parallel dispatch to multiple agents, then aggregate results | Code review by multiple analyzers simultaneously |
+| 2 | **debate** | diagnose → fix → loop (iterative critique between agents) | Bug diagnosis with cross-agent verification |
+| 3 | **reflection** | execute → self-review → improve | Code generation with self-correction |
+| 4 | **vote** | Multi-model concurrent execution → compare results | Selecting the best output from multiple LLMs |
+| 5 | **plan_execute** | Plan first → execute step by step | Complex multi-step tasks requiring decomposition |
+| 6 | **hitl** | Human-in-the-loop — pause for approval at critical steps | Sensitive operations (deployments, data deletion) |
+| 7 | **pipeline** | Sequential execution through a chain of agents | ETL pipelines, multi-stage processing |
+
+### Strategy Decision Flow
+
+```
+User Request
+     │
+     ▼
+┌─────────────────┐
+│ Intent Analysis │
+└────────┬────────┘
+         │
+    ┌────┴────┐
+    │  Single │      Multi
+    │  Agent? │───────┼──────────
+    └────┬────┘       │
+         │            ▼
+    ┌────┴────┐  ┌──────────┐
+    │ Execute │  │ Strategy │
+    │ Directly│  │ Selection│
+    └─────────┘  └────┬─────┘
+                      │
+         ┌────────────┼────────────┬───────────┬──────────┐
+         ▼            ▼            ▼           ▼          ▼
+     ┌──────┐   ┌────────┐  ┌──────────┐ ┌──────┐  ┌────────┐
+     │Fanout│   │ Debate │  │Reflection│ │ Vote │  │Pipeline│
+     └──────┘   └────────┘  └──────────┘ └──────┘  └────────┘
+                                           ┌──────┐
+                                           │HITL  │
+                                           └──────┘
+                                      ┌─────────────┐
+                                      │Plan_Execute │
+                                      └─────────────┘
+```
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.10 or higher
+- (Optional) API keys for LLM providers you plan to use
+
+### Installation
 
 ```bash
+# Clone the repository
 git clone https://github.com/xianyu-sheng/Agent-hub.git
 cd Agent-hub
+
+# (Recommended) Create a virtual environment
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# venv\Scripts\activate   # Windows
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Install in development mode
 pip install -e .
-agent-hub --version
 ```
 
-### 配置 LLM 模型
+### Configuration
 
-Agent Hub 提供**交互式引导**，只需模型名 + API Key：
+Create a `.env` file in the project root:
 
 ```bash
-# 交互模式（推荐）
-agent-hub models add
-# → 1/2 模型名称: deepseek-v4-pro
-# → 自动识别: deepseek → https://api.deepseek.com
-# → 2/2 API Key: DEEPSEEK_API_KEY
+# At least one LLM provider is required
+OPENAI_API_KEY=sk-...
+# or
+DEEPSEEK_API_KEY=sk-...
+# or
+ANTHROPIC_API_KEY=sk-ant-...
 
-# 命令行模式
-agent-hub models add gpt-4o -k OPENAI_API_KEY
+# Optional: Agent search paths (comma-separated)
+AGENT_PATH=./agents,~/my-agents
 ```
 
-支持自动识别：deepseek / claude / gpt / qwen / glm / doubao / moonshot / kimi / gemini / ollama
-
-### 注册专业 Agent
+### Basic Usage
 
 ```bash
-# 交互模式
-agent-hub agent register
-# → 项目路径: D:/SmartBench
+# Launch the REPL
+agent-hub repl
 
-# CLI 模式
-agent-hub agent register D:/OmniAgent_CLI
+# One-shot task execution
+agent-hub run "Review the code in ./src for security issues"
+
+# List discovered agents
+agent-hub list
+
+# Show agent details
+agent-hub info omniagent
+```
+
+### Example: Multi-Agent Workflow
+
+```
+User: "Fix the bug in main.py and update my resume to mention it"
+
+Agent Hub:
+  1. [Router] Parses intent → two tasks: code fix + resume update
+  2. [DAG Builder] Creates parallel DAG:
+     ┌─────────────┐
+     │─ OmniAgent  │── Code fix for main.py
+     │─ Resume-Sync│── Update resume
+     └─────────────┘
+  3. [Strategy] Assigns "reflection" to OmniAgent, "pipeline" to Resume-Sync
+  4. [Executor] Runs both in parallel, streams results to user
 ```
 
 ---
 
-## 🪄 完整命令参考
+## REPL Usage
 
-### 交互式命令中心
-
-```bash
-agent-hub                    # 进入 REPL，直接输入自然语言或命令
-```
-
-REPL 内支持所有子命令，且**自然语言自动路由**：
+Agent Hub includes a rich REPL interface built with [Rich](https://github.com/Textualize/rich).
 
 ```
-agent-hub > 你好，帮我分析项目代码并更新简历
-→ 自动识别为任务 → 路由到 smartbench + resume-sync → 执行
+$ agent-hub repl
+╔════════════════════════════════════════════════════════╗
+║                   Agent Hub REPL                       ║
+║         Multi-Agent Orchestration System               ║
+╚════════════════════════════════════════════════════════╝
+
+Detected agents:
+  [1] omniagent   - AI Coding Assistant (CLI / MCP)
+  [2] resume-sync - Resume Auto-Sync (CLI)
+  [3] SmartBench  - Code Diagnostic Platform (CLI / MCP)
+
+agent-hub> Review security of current project
+╭─ Router ───────────────────────────────────────────────╮
+│ Intent: code_review                                    │
+│ Agent: SmartBench                                      │
+│ Strategy: debate                                       │
+│ Confidence: 87%                                        │
+╰────────────────────────────────────────────────────────╯
+╭─ Execution ────────────────────────────────────────────╮
+│ [SmartBench] Diagnosing... ━━━━━━━━━━━━ 100% 0:00:05   │
+│ [SmartBench] Found 3 potential issues                  │
+│ [SmartBench] Generating fix recommendations...         │
+╰────────────────────────────────────────────────────────╯
 ```
 
-### 模型配置
+### REPL Commands
 
-```bash
-agent-hub models add              # 交互式引导添加（只需模型名 + Key）
-agent-hub models add <name> -k <KEY>  # 快速添加（自动识别供应商/API）
-agent-hub models list             # 列出已配置模型
-agent-hub models remove           # 交互式选择删除
-agent-hub models update           # 交互式引导更新
-agent-hub models info [name]      # 模型详情
-agent-hub models priority         # 查看/设置优先级
-```
-
-### Agent 管理
-
-```bash
-agent-hub agent register          # 交互式引导注册
-agent-hub agent list              # 列出所有已注册 Agent
-agent-hub agent info [name]       # Agent 详情（可选指定）
-agent-hub agent validate          # 验证所有 agent.yaml
-agent-hub agent models [name]     # 查看 Agent 声明的模型
-agent-hub agent reload            # 重载配置
-```
-
-### 系统控制
-
-```bash
-agent-hub start                   # 验证所有 Agent 就绪状态 (TUI 仪表盘)
-agent-hub stop                    # 停止通过 start 启动的进程
-agent-hub status                  # 查看运行状态
-```
-
-### 定时调度
-
-```bash
-agent-hub schedule list                              # 列出所有定时任务
-agent-hub schedule add <name> \                      # 添加定时任务
-  --cron "0 9 * * 1-5" --agent <agent> --task <task>
-agent-hub schedule remove [name]                     # 删除定时任务
-agent-hub schedule run [name]                        # 手动触发一次
-agent-hub schedule history                           # 查看执行历史 (最近 20 条)
-```
-
-### 任务执行
-
-```bash
-agent-hub run "分析代码并更新简历"  # 带仪表盘的多 Agent 调度（自动选择协作策略）
-agent-hub run --no-dashboard "..." # 纯命令行模式
-agent-hub run                      # 交互式任务模式
-```
+| Command | Description |
+|---|---|
+| `help` | Show available commands |
+| `agents` / `list` | List all discovered agents |
+| `info <name>` | Show agent details |
+| `status` | Show system status and running tasks |
+| `history` | Show conversation history |
+| `clear` | Clear conversation history |
+| `exit` / `quit` | Exit the REPL |
 
 ---
 
-## 🛡️ 兜底机制
+## Command Reference
 
-未配置模型或 API Key 时，系统不会报晦涩的技术错误，而是**给出精确的修复命令**：
+### CLI Commands
 
-```
-⚠ 已配置 1 个模型，但 API Key 均未设置: deepseek-v4-pro
-  设置环境变量: set DEEPSEEK_API_KEY=sk-xxxx
-  或更新模型: models update deepseek-v4-pro -k sk-xxxx
-```
+| Command | Description |
+|---|---|
+| `agent-hub repl` | Launch the interactive TUI REPL |
+| `agent-hub run <task>` | One-shot task execution |
+| `agent-hub list` | List discovered agents |
+| `agent-hub info <name>` | Show agent details |
+| `agent-hub status` | Show system status |
+| `agent-hub cron list` | Show scheduled cron jobs |
+| `agent-hub cron add <schedule>` | Add a cron job |
+| `agent-hub cron remove <id>` | Remove a cron job |
 
-三层检查：
-1. **欢迎横幅** — 进入即显示就绪状态
-2. **任务执行前** — 前置拦截，未就绪直接返回指引
-3. **LLM 调用失败** — 列出尝试的模型 + 排查建议
+### CLI Options
+
+| Option | Description |
+|---|---|
+| `--config <path>` | Path to config file |
+| `--agent-path <path>` | Additional path to search for agent.yaml files |
+| `--llm <provider>` | LLM provider to use (openai, deepseek, etc.) |
+| `--model <name>` | Model name override |
+| `--verbose` / `-v` | Verbose output |
+| `--quiet` / `-q` | Quiet mode (minimal output) |
 
 ---
 
-## 📋 Agent Manifest 协议
+## Agent Manifest Protocol
 
-每个专业 Agent 项目根目录下放置 `agent.yaml`：
+The Agent Manifest protocol is the contract between Agent Hub and any professional agent. Each agent project adds a single `agent.yaml` file at its root.
+
+### Schema
 
 ```yaml
-name: my-agent
-display_name: "我的 Agent"
-description: |
-  描述此 Agent 的功能和特点（供 LLM 路由使用）。
-protocol: cli
-version: "1.0"
+name: omniagent                            # Unique agent identifier
+display_name: "OmniAgent"                  # Human-readable name
+description: "AI-powered coding assistant  # What this agent does
+  with multi-model support, MCP tools,
+  and ReAct workflows."
+
+protocol: cli                              # Communication protocol
+                                           # Options: cli | internal | mcp | http
 
 capabilities:
-  tasks:
-    - name: do_something          # 任务名（需匹配实际 CLI 命令）
-      description: 执行某个操作
-      input:
-        goal: "string — 任务目标"
-      output:
-        result: "string — 执行结果"
+  - task: code_generation                   # Task identifier
+    description: "Generate code from        # Task description
+      natural language descriptions"
+    interface:                              # How to invoke this task
+      command: "omniagent run"
+      args: "{query}"
+      # Template variables:
+      #   {query}      - Original user input
+      #   {session_id} - Current session ID
+      #   {context}    - Conversation context
+    examples:                               # Example queries for this task
+      - "Create a Python REST API with FastAPI"
+      - "Write a binary search in Rust"
 
-interface:
-  command: my-agent {task} --json-output "{goal}"  # CLI 命令模板
+  - task: code_review
+    description: "Review code for bugs,
+      security issues, and best practices"
+    interface:
+      command: "omniagent review"
+      args: "{query}"
+    examples:
+      - "Review auth.py for security issues"
+      - "Check my merge request for bugs"
 ```
 
-### 命令模板占位符
+### Protocol Types
 
-| 占位符 | 来源 | 示例 |
-|--------|------|------|
-| `{task}` | 任务名 | `analyze_code` |
-| `{goal}` | params.goal | `分析项目结构` |
-| `{mode}` | params.mode | `react` |
-| `{project}` | params.project_path | `D:/project` |
-| `{params_json}` | 完整 params JSON | `{"goal":"..."}` |
+| Protocol | Description |
+|---|---|
+| `cli` | Invoke via command line subprocess. Requires `command` and `args` in the interface definition. |
+| `internal` | Direct Python import and function call. Agent Hub loads the agent as a Python module. |
+| `mcp` | Model Context Protocol — communicate via stdio or SSE transport. |
+| `http` | Invoke via HTTP request to a running service. Requires `url` in the interface definition. |
 
-### 协议类型
+### Agent Discovery
 
-| 协议 | 说明 |
-|------|------|
-| `cli` | CLI 子进程调用（默认） |
-| `internal` | 进程内调度（agent-hub 自身，防递归） |
-| `mcp` | MCP 协议（预留） |
-| `http` | HTTP 接口（预留） |
+Agent Hub discovers agents by searching for `agent.yaml` files in:
 
-### 调度关系声明 (`scheduled_agents`)
-
-当一个 Agent 是**调度/编排系统**（通过 CLI Bridge 调度其他 Agent）时，应在 `agent.yaml` 中声明 `scheduled_agents`，描述它调度的子 Agent 及其角色：
-
-```yaml
-# agent-hub 的 agent.yaml 示例
-name: agent-hub
-display_name: "Agent Hub Scheduler"
-protocol: internal
-
-scheduled_agents:
-  - name: omniagent
-    repo: D:/OmniAgent_CLI
-    role: "通用 AI 编程 Agent — 代码分析、生成、重构、命令执行"
-    interface: cli
-  - name: smartbench
-    repo: D:/SmartBench
-    role: "代码质量诊断引擎 — 静态分析、性能基准、项目指纹"
-    interface: cli
-  - name: resume-sync
-    repo: D:/工作/resume-sync
-    role: "简历自动同步器 — Git 变更检测 → LLM 生成 → LaTeX 编译"
-    interface: cli
-```
-
-**字段说明**：
-
-| 字段 | 必需 | 说明 |
-|------|------|------|
-| `name` | ✅ | 子 Agent 名称（需与对应 agent.yaml 中的 `name` 一致） |
-| `repo` | ✅ | 子 Agent 项目根目录的绝对路径 |
-| `role` | ✅ | 子 Agent 在调度系统中的角色（1-2 句话，供 resume-sync 等下游工具生成简历时使用） |
-| `interface` | ❌ | 调度接口类型（`cli` / `mcp` / `http`，默认 `cli`） |
-
-**用途**：
-
-- **resume-sync 集成**：生成简历要点时自动读取 `scheduled_agents`，注入子项目关系上下文，使 LLM 产出体现系统架构层级的描述（例如"设计了一套多 Agent 协同调度系统"而非"做了 3 个独立项目"）
-- **健康检查**（规划中）：`agent-hub start` 仪表盘可按调度关系展示拓扑
-- **文档自生成**：下游工具可据此生成架构图、依赖关系图
-
-> 💡 **设计原则**：`scheduled_agents` 描述的是"调度关系"，不是"依赖关系"。如果 Agent A 只是调用了 Agent B 的 API（而非通过 Agent Manifest 协议调度），不应列在此处。
+1. Paths specified in the `AGENT_PATH` environment variable (comma-separated).
+2. Default search paths: `./agents/`, `~/.agent-hub/agents/`.
+3. Paths passed via the `--agent-path` CLI option.
 
 ---
 
-## 🏗️ 架构
+## Readiness Check
+
+Agent Hub performs a three-layer readiness check at startup:
 
 ```
-agent_hub/
-├── __init__.py          # 版本 0.2.0
-├── manifest.py          # AgentManifest 数据模型 + YAML 加载 + Agent 发现
-├── bridge.py            # CLI Bridge 子进程调用 + Agent 生命周期 + Watchdog 自愈
-├── router.py            # LLM 意图路由 + 输入优化 + 协作策略推断 + 路由记忆
-├── scheduler.py         # 中央调度器：策略分派 → DAG 执行 → 循环控制 → 汇总
-├── dashboard.py         # Rich TUI 仪表盘 (AgentDashboard + HealthDashboard)
-├── llm.py               # 异步 OpenAI-compatible chat completion 客户端
-├── model_config.py      # 模型配置管理 (models.yaml CRUD + 就绪检查)
-├── session_store.py     # 跨轮次会话记忆 (上下文注入 + 指代消解)
-├── cron.py              # 定时调度引擎 (5 字段 cron + 执行历史)
-├── pid_store.py         # 跨 CLI 调用的进程状态持久化
-└── cli.py               # Click 命令行入口 + 交互式 REPL
+Layer 1: Welcome Banner
+  ┌────────────────────────────────────────────┐
+  │  Agent Hub v0.x.x                          │
+  │  Multi-Agent Orchestration System          │
+  │  Agents discovered: 3                      │
+  └────────────────────────────────────────────┘
+
+Layer 2: Pre-Execution Check
+  ✓ Agent manifests valid
+  ✓ LLM provider configured
+  ✓ Network connectivity OK
+
+Layer 3: LLM Call Failure Guidance
+  ✗ API call failed: rate limited
+  → Guidance: "You've hit the rate limit.
+    Retry in 30 seconds or switch to a
+    different provider with --llm deepseek"
 ```
-
-### 调度流水线
-
-```
-用户输入 "将 omniagent 代码质量提升到 A 级"
-    │
-    ▼
-┌───────────────────┐
-│ 0. 会话上下文注入  │  ← SessionStore.get_recent_context(3) — 最近 3 轮历史
-├───────────────────┤
-│ 1. 就绪检查        │  ← check_system_ready() — 模型+Key 是否可用
-├───────────────────┤
-│ 2. Agent 发现      │  ← 扫描 agents.d/*.yaml → 加载 agent.yaml
-├───────────────────┤
-│ 3. 路由记忆检查    │  ← routing_memory.json — 相同请求跳过 LLM
-├───────────────────┤
-│ 4. 意图路由 (LLM)  │  ← 分解为跨 Agent DAG + 推断协作策略 + 置信度
-├───────────────────┤
-│ 5. 策略分派        │  ← 根据 strategy 选择执行模式
-│   ├─ fan_out       │     并行分派 → 汇总
-│   ├─ debate        │     A诊断 → B修复 → 循环直到通过阈值
-│   ├─ reflection    │     执行 → 自审 → 改进（循环）
-│   ├─ vote          │     多模型并发 → 比较差异 → 选最佳
-│   ├─ plan_execute  │     先规划 → 按步执行 → 失败重规划
-│   └─ hitl          │     逐任务执行 → 审批关卡暂停等人类确认
-├───────────────────┤
-│ 6. DAG 波次/循环   │  ← Kahn 拓扑排序 (fan_out) 或 迭代循环 (debate/reflection)
-├───────────────────┤
-│ 7. LLM 汇总        │  ← 整合多 Agent 输出 → 连贯结论
-├───────────────────┤
-│ 8. 会话保存        │  ← 保存到 .agent_hub/sessions/ + 高置信度路由记忆
-└───────────────────┘
-```
-
-### 协作策略
-
-Agent Hub 不只是把任务分派给 Agent，它根据任务性质**自动选择协作模式**：
-
-| 策略 | 触发场景 | 工作方式 |
-|------|---------|---------|
-| **fan_out** `并行分派` | 独立任务、信息查询 | 并行执行 → LLM 汇总（默认） |
-| **debate** `辩论-修复` | "提升/优化/修复" | A 诊断 → B 修复 → A 再诊断 → 循环直到通过阈值 |
-| **reflection** `自反思` | "写/创作/生成" | 执行 → 自审查 → 改进 → 循环 |
-| **vote** `多视角投票` | "评估/对比/审查" | 同一问题 → 多模型 → 比较差异 → 选最佳 |
-| **plan_execute** `规划-执行` | "实现/开发/构建" | 先规划分步 → 按步执行 → 失败自动重规划 |
-| **hitl** `人机协同` | "部署/推送/发布" | 关键步骤暂停等人类 [Y]批准 [n]拒绝 [r]重试 |
-| **pipeline** `串行管线` | 有严格先后依赖 | A→B→C 串行执行 |
-
-**策略由 LLM 路由器自动推断**，用户无需指定。若 LLM 未指定策略，系统根据关键词自动回退选择（`CollaborationStrategy.default_for()`）。
-
-### 智能路由
-
-- **输入优化**：自动追加精确任务名索引，防止 LLM 臆造不存在的任务
-- **协作策略推断**：LLM 分析任务性质 → 自动选择最佳协作模式（debate/reflection/vote...）
-- **路由记忆**：相同请求命中时跳过 LLM，直接使用缓存路由（`routing_memory.json`）
-- **置信度门禁**：路由置信度 < 0.7 时显示警告，防止错误路由静默执行
-- **模糊匹配**：LLM 输出的任务名自动修正到最接近的实际任务
-- **规则回退**：LLM 不可用时的规则路由（confidence=0.3）+ 自动策略检测
-- **退出条件**：循环策略支持 `score >= 90`、`pass_rate > 0.9` 等表达式求值
 
 ---
 
-## 🔬 测试
+## Testing
+
+Agent Hub includes 30 tests covering:
+
+- **Agent Manifest Protocol**: Schema validation, field parsing, optional field defaults.
+- **Real Project agent.yaml Validation**: Validates manifests from omniagent, resume-sync, and SmartBench.
+- **Routing Logic**: Intent parsing, confidence scoring, fallback behavior.
+- **DAG Construction**: Multi-agent dependency resolution, cycle detection.
 
 ```bash
-pip install -e ".[dev]"
-pytest tests/ -v           # 30 tests (manifest 协议全覆盖 + 真实项目 agent.yaml 验证)
+# Run all tests
+pytest
+
+# Run with coverage
+pytest --cov=agent_hub --cov-report=term-missing
+
+# Run specific test file
+pytest tests/test_manifest.py
 ```
 
 ---
 
----
-
-## 🔧 高级特性
-
-### 会话记忆（Session Memory）
-
-Agent Hub 自动记住每次调度的上下文，实现**跨轮次感知**：
+## Project Map
 
 ```
-agent-hub > 列出所有 agent
-→ 路由: agent-hub.discover_capabilities → 发现 4 个 Agent
-
-agent-hub > 再列一次    ← "再"被正确理解为指代上一轮
-→ 读取 SessionStore 上下文 → 路由到相同任务
+agent-hub/
+├── agent_hub/                 # Core package
+│   ├── __init__.py
+│   ├── router.py              # Smart routing engine
+│   ├── dag/                   # DAG scheduler
+│   │   ├── builder.py
+│   │   └── executor.py
+│   ├── strategies/            # 7 collaboration strategies
+│   │   ├── fan_out.py
+│   │   ├── debate.py
+│   │   ├── reflection.py
+│   │   ├── vote.py
+│   │   ├── plan_execute.py
+│   │   ├── hitl.py
+│   │   └── pipeline.py
+│   ├── manifest/              # Agent Manifest protocol
+│   │   ├── parser.py
+│   │   └── validator.py
+│   ├── memory/                # Session memory
+│   │   └── session.py
+│   ├── cron/                  # Cron scheduler
+│   │   └── scheduler.py
+│   ├── watchdog/              # Process watchdog
+│   │   └── monitor.py
+│   └── cli/                   # CLI & REPL
+│       ├── main.py
+│       └── repl.py
+├── tests/                     # Test suite (30 tests)
+│   ├── test_manifest.py
+│   ├── test_routing.py
+│   └── test_strategies.py
+├── agents/                    # Sample agent manifests
+│   ├── omniagent/
+│   │   └── agent.yaml
+│   ├── resume-sync/
+│   │   └── agent.yaml
+│   └── SmartBench/
+│       └── agent.yaml
+├── requirements.txt
+├── setup.py
+└── README.md
 ```
 
-- 每轮调度自动保存到 `.agent_hub/sessions/`（JSON）
-- 最近 3 轮上下文注入 LLM 路由 prompt，实现指代消解
-- 自动清理最旧的会话文件（保留 50 轮）
+---
 
-### 路由反馈闭环（Routing Feedback）
+## FAQ
 
-路由错误可持续改进：
+**Q: How is Agent Hub different from other agent frameworks (LangChain, AutoGen, CrewAI)?**
 
-- **置信度门禁**：路由置信度 < 70% 时显示警告 + 路由分析
-- **路由记忆**：用户确认的高置信度路由自动保存到 `routing_memory.json`
-- **记忆优先**：相同请求命中时跳过 LLM 调用，直接使用缓存路由（confidence=0.9）
-- **规则回退增强**：LLM 不可用时自动检测协作策略 + 检查路由记忆
+Agent Hub is designed around **zero-intrusion** and **decoupled discovery**. Unlike frameworks that require you to import SDKs or subclass base classes, Agent Hub simply reads `agent.yaml` files from existing projects. It's an orchestrator, not a framework — your agents remain completely independent.
 
-### Agent 健康自愈（Watchdog）
+**Q: Can I add my own agent without modifying Agent Hub?**
 
-Agent 进程异常退出后**自动重启**：
+Yes. Write an `agent.yaml` file in your project root, place it somewhere Agent Hub can discover it (via `AGENT_PATH` or `--agent-path`), and Agent Hub will automatically detect it. Zero code changes to Agent Hub or your project.
 
-- 每 15 秒扫描注册表，发现 `desired_state == "running"` 但进程已退出 → 自动重启
-- 5 分钟内最多重启 3 次（防止无限重启循环）
-- 超过限制 → 标记为 `failed` + 日志告警
-- `agent-hub stop` 主动停止 → 设置 `desired_state = "stopped"` → 不会自动重启
+**Q: What LLM providers are supported?**
 
-### 定时调度（Cron Scheduler）
+Agent Hub is provider-agnostic. It can work with OpenAI, DeepSeek, Anthropic Claude, Google Gemini, Qwen, Ollama (local), and any OpenAI-compatible API endpoint.
 
-Agent Hub 可以**自主定时执行任务**，无需人工触发：
+**Q: How does the DAG scheduler handle failures?**
 
-```bash
-# 每个工作日早上 9 点自动诊断代码质量
-agent-hub schedule add daily-check \
-  --cron "0 9 * * 1-5" \
-  --agent smartbench \
-  --task diagnose_code \
-  --params '{"project": "omniagent"}'
+The watchdog monitors all running processes. If a process crashes, it attempts up to 3 restarts within 5 minutes. If exceeded, the agent is marked as failed. The DAG executor receives the failure status and can trigger fallback strategies or notify the user.
 
-# 查看任务和执行历史
-agent-hub schedule list
-agent-hub schedule history
-```
+**Q: Can I use Agent Hub for production workloads?**
 
-- 纯 Python cron 引擎（零外部依赖）
-- 支持标准 5 字段 cron：`*`、`*/N`、`1-5`、`0,30`
-- 执行历史持久化到 `.agent_hub/cron_history.json`
-- 调度器启动时自动加载并运行 cron 循环
+Agent Hub is currently in **beta**. It has been tested with 30 tests covering core protocols and real agent manifests, but production use may require additional hardening for your specific environment.
 
 ---
 
-## 🩺 故障排查
+## License
 
-### 任务执行超时（300s Timeout）
-
-**症状**：`agent-hub run "编写代码"` 路由到 omniagent 后挂起，300 秒超时。
-
-**根因**：omniagent 收到任务后进入交互式 REPL（`Prompt.ask()`），与 agent-hub 竞争终端 stdin，导致永久阻塞。
-
-**修复**（两个层面）：
-
-1. **OmniAgent ≥ feat/headless-execution**：新增 `--goal` 参数支持非交互模式（自动批准工具调用、结果输出到 stdout 后退出）。agent.yaml 命令模板已更新为：
-   ```
-   omniagent --mode {mode} --goal "{goal}"
-   ```
-
-2. **Agent-hub ≥ fix/stdin-devnull**：bridge.py 子进程启动时设置 `stdin=DEVNULL`，防止任何 Agent 意外竞争终端输入。即使 Agent 进入 REPL，也会因 EOF 立即退出而非挂起。
-
-**验证**：
-```bash
-# 直接测试 omniagent headless 模式
-omniagent --mode react --goal "写一个 Python 快速排序函数"
-
-# 全链路测试
-agent-hub run "写一个 Python 快速排序函数"
-```
-
-### Agent 命令未找到
-
-确保 Agent 的 CLI 入口已安装到 PATH（如 `pip install -e .`），或 agent.yaml 中 `interface.command` 使用完整路径。
+[MIT](LICENSE) © Xianyu Sheng
 
 ---
 
-## 🗺️ 路线图
-
-### 已完成
-
-- [x] Agent Manifest 协议 (agent.yaml)
-- [x] CLI Bridge + Agent 生命周期管理 + Watchdog 自愈
-- [x] LLM 意图路由 → 跨 Agent DAG + 协作策略推断
-- [x] 输入优化器 (Prompt Optimizer)
-- [x] Rich TUI 仪表盘 (AgentDashboard + StartDashboard)
-- [x] DAG 并行调度 (Kahn 波次) + 循环策略引擎
-- [x] 交互式 REPL (agent-hub 默认命令)
-- [x] 自然语言自动路由（无需 run 前缀）
-- [x] 模型配置管理 (models add/remove/list/update/priority)
-- [x] 就绪检查 + 用户友好错误指引
-- [x] 跨轮次会话记忆 (SessionStore + 上下文注入)
-- [x] 路由反馈闭环 (置信度门禁 + routing_memory)
-- [x] 7 种协作策略 (fan_out/debate/reflection/vote/plan_execute/hitl/pipeline)
-- [x] 定时调度 (cron 引擎 + schedule 命令组)
-- [x] Agent 健康自愈 (Watchdog 自动重启)
-- [x] 协议完整性 (mcp/http 预留 + 防御性错误信息)
-
-### 规划中
-
-- [ ] MCP/HTTP 协议实现
-- [ ] Agent 间直接通信（不经过 Hub 汇总）
-- [ ] 多用户会话隔离
-- [ ] Web Dashboard
-
----
-
-## 📄 许可
-
-MIT License
-
----
-
-## 👤 作者
-
-**xianyu-sheng**
-
-> 从「做了很多项目」到「设计了一个 Agent 系统」—— Agent Hub 是多 Agent 协同调度的思考和实现。
+<p align="center">
+  <sub>Built with ❤️ for the open-source AI agent community</sub>
+</p>
