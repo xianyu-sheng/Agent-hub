@@ -1,9 +1,4 @@
 # Agent Hub 注册文件 — resume-sync
-# 由 agent-hub agent register D:/工作/resume-sync 生成
-# 可手动编辑 project_path 指向你的项目位置
-
-project_path: D:/工作/resume-sync
-
+project_path: D:\工作\resume-sync
 # Agent: 简历同步器
-# 协议: cli
-# 任务数: 5 (check_changes, generate_bullets, apply_and_build, run_full_pipeline, get_status)
+# 任务数: 7

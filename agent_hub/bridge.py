@@ -486,6 +486,35 @@ class CLIBridge:
             return m.group(1)
         return None
 
+    @staticmethod
+    def _ensure_project_dir(project: str) -> str:
+        """将文件路径转换为项目目录（如果传入的是文件而非目录）。
+
+        某些 Agent（如 smartbench）的 --project 参数要求传入项目根目录，
+        若传入具体文件（如 scheduler.py）会导致 resolve_project_path() 的
+        is_dir() 检查失败，输出 "Cannot access"。
+
+        策略：
+        - 如果路径以 .py/.js/.ts/.java/.go/.rs 等常见源码扩展名结尾 → 取父目录
+        - 否则原样返回
+        """
+        if not project:
+            return project
+        import os
+        # 常见源码文件扩展名
+        _SRC_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go",
+                     ".rs", ".c", ".cpp", ".h", ".hpp", ".rb", ".php",
+                     ".swift", ".kt", ".scala", ".r", ".m", ".mm"}
+        _, ext = os.path.splitext(project)
+        if ext.lower() in _SRC_EXTS:
+            parent = os.path.dirname(project)
+            if parent and os.path.isdir(parent):
+                logger.debug(
+                    "文件路径 → 项目目录: %s → %s", project, parent
+                )
+                return parent.replace("\\", "/")
+        return project
+
     def _build_command(
         self,
         manifest: AgentManifest,
@@ -513,7 +542,6 @@ class CLIBridge:
         project = str(params.get("project", params.get("project_path", "")))
 
         # 从 goal 文本自动提取项目路径（覆盖 LLM 路由可能产生的损坏路径）
-        # 例如 LLM 输出的 "D:OmniAgent_CLI"（缺少斜杠）会被 raw_goal 中的正确路径覆盖
         extracted = self._extract_project_path(raw_goal)
         if extracted:
             if project and project != extracted:
@@ -524,12 +552,46 @@ class CLIBridge:
         elif not project:
             project = ""
 
+        # 文件路径 → 项目目录转换
+        # 某些 Agent（如 smartbench）的 --project 参数要求目录而非文件，
+        # 传入 scheduler.py 会导致 resolve_project_path().is_dir() 失败。
+        project = self._ensure_project_dir(project)
+
+        # 项目路径 → 项目名转换（用于 resume-sync 等按名称索引的 Agent）
+        # 如果模板使用 {project} 作为位置参数（而非 --project {project}），
+        # 则提取路径的最后一个组件作为项目名。
+        if project and "{project}" in template:
+            if "--project" not in template and "-p " not in template:
+                import os as _os
+                project_name = _os.path.basename(project.rstrip("/\\"))
+                if project_name:
+                    logger.debug(
+                        "项目路径 → 项目名: %s → %s", project, project_name
+                    )
+                    project = project_name
+
+        # 注入 Pipeline 上下文：前序波次的结果摘要拼接到 goal 末尾
+        pipeline_ctx = str(params.get("_pipeline_context", ""))
+        if pipeline_ctx:
+            raw_goal = f"{raw_goal}\n\n{pipeline_ctx}"
+            goal = self._sanitize_goal(raw_goal, self._MAX_GOAL_LENGTH * 3)
+        else:
+            goal = self._sanitize_goal(raw_goal, self._MAX_GOAL_LENGTH)
+
+        if len(raw_goal) > self._MAX_GOAL_LENGTH and not pipeline_ctx:
+            logger.debug(
+                "Goal 从 %d 字符截断至 %d: %s...",
+                len(raw_goal), len(goal), goal[:80],
+            )
+
         command_str = template.replace("{task}", task_name)
         command_str = command_str.replace("{goal}", goal)
         command_str = command_str.replace("{mode}", mode)
         command_str = command_str.replace("{project}", project)
+        # 从 params_json 中移除内部字段，避免泄露到 Agent CLI
+        clean_params = {k: v for k, v in params.items() if not k.startswith("_")}
         command_str = command_str.replace(
-            "{params_json}", json.dumps(params, ensure_ascii=False)
+            "{params_json}", json.dumps(clean_params, ensure_ascii=False)
         )
 
         # 简单的 shell 分词（支持引号）

@@ -159,6 +159,31 @@ def _compute_waves(tasks: list[RoutedTask]) -> list[list[RoutedTask]]:
     return waves
 
 
+def _build_wave_context(prev_results: list[TaskExecutionResult]) -> str:
+    """从前一波次的结果构建上下文摘要，注入到后续波次的任务中。
+
+    解决 Pipeline 模式下的上下文断裂问题：Wave 2 收到泛型 prompt 却不知道
+    Wave 1 发现了什么（或什么都没发现），导致重复工作或搜索错误的目标。
+    """
+    if not prev_results:
+        return ""
+    lines = ["## 前序波次执行结果"]
+    for r in prev_results:
+        status = "✅ 成功" if r.success else f"❌ 失败: {r.error}"
+        output_summary = ""
+        if r.output:
+            # 截取前 500 字符作为摘要，防止 prompt 膨胀
+            output_summary = r.output[:500]
+            if len(r.output) > 500:
+                output_summary += "..."
+        lines.append(
+            f"- [{r.task.agent}] {r.task.task}: {status}\n"
+            f"  输出摘要: {output_summary}"
+        )
+    return "\n".join(lines)
+
+
+
 # ── 调度器 ──────────────────────────────────────────────────────────
 
 
@@ -940,9 +965,21 @@ class AgentScheduler:
             f"[dim]🔄 DAG 执行: {len(route_plan.tasks)} 步, {len(waves)} 波[/dim]"
         )
 
+        prev_wave_results: list[TaskExecutionResult] = []
+
         with dash.run():
             for wave_idx, wave in enumerate(waves):
                 wave_label = f"Wave {wave_idx + 1}/{len(waves)}"
+
+                # 注入前序波次上下文到当前波次的任务中
+                if wave_idx > 0 and prev_wave_results:
+                    ctx = _build_wave_context(prev_wave_results)
+                    for task in wave:
+                        task.params["_pipeline_context"] = ctx
+                        self.console.print(
+                            f"[dim]  ↳ 注入 Wave {wave_idx} 上下文 "
+                            f"({len(ctx)} 字符)[/dim]"
+                        )
 
                 # 标记波内任务为 running
                 for task in wave:
@@ -957,6 +994,9 @@ class AgentScheduler:
                 ]
                 results = await asyncio.gather(*tasks_coros, return_exceptions=True)
 
+                # 本轮波次结果（用于下一波次上下文注入）
+                wave_results: list[TaskExecutionResult] = []
+
                 # 处理波次结果
                 for task, result in zip(wave, results):
                     if isinstance(result, Exception):
@@ -969,6 +1009,9 @@ class AgentScheduler:
                         exec_result = result
 
                     task_results.append(exec_result)
+
+                    # 保存波次结果用于下一波次上下文注入
+                    wave_results.append(exec_result)
 
                     # 更新仪表盘
                     status = "done" if exec_result.success else "failed"
@@ -987,6 +1030,9 @@ class AgentScheduler:
                         dash.agent_panels[task.agent].set_status(status)
 
                 dash.refresh()
+
+            # 保存本轮波次结果，供下一波次使用
+            prev_wave_results = wave_results
 
         # 汇总 — 在仪表盘内完成，避免退出 Live 后用户看到空白终端
         # 先显示"汇总中"状态，然后调用 LLM，最后更新结果面板
@@ -1013,6 +1059,7 @@ class AgentScheduler:
     ) -> SchedulerResult:
         """流式输出模式 — Agent 输出实时滚动（类似 pip install）。"""
         task_results: list[TaskExecutionResult] = []
+        prev_wave_results: list[TaskExecutionResult] = []
 
         waves = _compute_waves(route_plan.tasks)
 
@@ -1032,6 +1079,12 @@ class AgentScheduler:
                     f"[dim]── Wave {wave_idx + 1}/{len(waves)} ──[/dim]"
                 )
 
+            # 注入前序波次上下文到当前波次的任务中
+            if wave_idx > 0 and prev_wave_results:
+                ctx = _build_wave_context(prev_wave_results)
+                for task in wave:
+                    task.params["_pipeline_context"] = ctx
+
             # 构建任务协程：外部 Agent 带流式回调，内部 Agent 走原路径
             tasks_coros = []
             for task in wave:
@@ -1048,6 +1101,7 @@ class AgentScheduler:
 
             results = await asyncio.gather(*tasks_coros, return_exceptions=True)
 
+            wave_results: list[TaskExecutionResult] = []
             for task, result in zip(wave, results):
                 if isinstance(result, Exception):
                     exec_result = TaskExecutionResult(task=task, success=False, error=str(result))
@@ -1061,6 +1115,9 @@ class AgentScheduler:
                     )
 
                 task_results.append(exec_result)
+                wave_results.append(exec_result)
+
+            prev_wave_results = wave_results
 
         aggregate = await self._aggregate(user_input, task_results, route_plan.analysis)
 
