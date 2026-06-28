@@ -426,11 +426,13 @@ class IntentRouter:
         confidence = float(data.get("confidence", 0.7))
         confidence = max(0.0, min(1.0, confidence))  # 钳制在 [0, 1]
 
-        # 提取协作策略
-        strategy = str(data.get("strategy", CollaborationStrategy.FAN_OUT))
-        if not CollaborationStrategy.is_valid(strategy):
-            logger.warning("LLM 输出了未知策略 '%s'，回退到 fan_out", strategy)
-            strategy = CollaborationStrategy.FAN_OUT
+        # 提取协作策略：LLM 未指定时用关键词推断
+        strategy = str(data.get("strategy", ""))
+        if not strategy or not CollaborationStrategy.is_valid(strategy):
+            if strategy:
+                logger.warning("LLM 输出了未知策略 '%s'，回退到自动推断", strategy)
+            strategy = CollaborationStrategy.default_for(analysis)
+            logger.info("自动推断策略: %s → %s", analysis[:60], strategy)
 
         max_iterations = int(data.get("max_iterations", 1))
         max_iterations = max(1, min(10, max_iterations))  # 钳制在 [1, 10]
@@ -607,11 +609,15 @@ class IntentRouter:
                     depends_on=[],
                 ))
 
+        auto_strategy = CollaborationStrategy.default_for(user_input)
         return RoutePlan(
             tasks=selected,
             analysis=f"规则回退路由：根据关键词匹配选择了 {len(selected)} 个 Agent",
             is_parallel=len(selected) > 1 and all(not t.depends_on for t in selected),
             confidence=0.3,  # 规则回退的置信度远低于 LLM 路由
+            strategy=auto_strategy,
+            max_iterations=3 if CollaborationStrategy.is_loop(auto_strategy) else 1,
+            exit_condition="success" if CollaborationStrategy.is_loop(auto_strategy) else "",
         )
 
     # ── 路由记忆 ─────────────────────────────────────────────────
@@ -717,6 +723,7 @@ class IntentRouter:
                     "task": task.task,
                     "description": task.description,
                     "params": task.params,
+                    "strategy": route_plan.strategy,
                     "saved_at": _dt.now(_tz.utc).isoformat(),
                 })
 
