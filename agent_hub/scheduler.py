@@ -23,6 +23,7 @@ import os
 import sys
 import time as time_mod
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 # ── Windows UTF-8 编码修复 ──────────────────────────────────────────
@@ -38,9 +39,11 @@ if sys.platform == "win32":
 from rich.console import Console
 
 from agent_hub.bridge import AgentProcessRegistry, CLIBridge
+from agent_hub.cron import CronJob, CronRunRecord, CronScheduler
 from agent_hub.dashboard import AgentDashboard, TaskNode
 from agent_hub.manifest import AgentManifest, discover_from_registry
 from agent_hub.router import IntentRouter, RoutePlan, RoutedTask
+from agent_hub.session_store import SessionStore, new_session_record
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +199,8 @@ class AgentScheduler:
         self._registry: AgentProcessRegistry | None = None
         self._dashboard: AgentDashboard | None = None
         self._agents: dict[str, AgentManifest] = {}
+        self._session_store: SessionStore | None = None
+        self._cron: CronScheduler | None = None
 
     @property
     def router(self) -> IntentRouter:
@@ -261,6 +266,12 @@ class AgentScheduler:
             agents = self._load_agents()
         self._agents = agents
 
+        # 自动启动 Watchdog（仅首次，内部有去重保护）
+        self.bridge.start_watchdog()
+
+        # 自动启动 Cron 调度器（仅首次，内部有去重保护）
+        self._start_cron_if_needed()
+
         if not agents:
             return SchedulerResult(
                 user_input=user_input,
@@ -273,9 +284,18 @@ class AgentScheduler:
 
         self.console.print(f"[dim]发现 {len(agents)} 个 Agent: {', '.join(agents.keys())}[/dim]")
 
-        # Step 2: 意图路由
+        # Step 2: 意图路由（注入最近 3 轮会话上下文）
         self.console.print("[dim]🔍 分析意图...[/dim]")
-        route_plan = await self.router.route(user_input, agents)
+        session_context = ""
+        try:
+            if self._session_store is None:
+                self._session_store = SessionStore()
+            session_context = self._session_store.get_recent_context(3)
+        except Exception:
+            pass
+        route_plan = await self.router.route(
+            user_input, agents, session_context=session_context,
+        )
 
         if not route_plan.tasks:
             self.console.print(f"[yellow]⚠ {route_plan.analysis}[/yellow]")
@@ -290,6 +310,13 @@ class AgentScheduler:
             f"({', '.join(route_plan.agents_involved)})[/dim]"
         )
 
+        # 低置信度警告
+        if route_plan.is_low_confidence:
+            self.console.print(
+                f"[yellow]⚠️  路由置信度较低 ({route_plan.confidence:.0%})[/yellow]\n"
+                f"[dim]  分析: {route_plan.analysis}[/dim]"
+            )
+
         # Step 3-5: DAG 执行 + Dashboard + 汇总
         if show_dashboard:
             result = await self._execute_with_dashboard(user_input, route_plan, agents)
@@ -297,6 +324,39 @@ class AgentScheduler:
             result = await self._execute_headless(user_input, route_plan, agents)
 
         result.total_duration_ms = (time_mod.monotonic() - start_time) * 1000
+
+        # 高置信度路由 → 自动保存到路由记忆（加速后续相同请求）
+        if not route_plan.is_low_confidence and result.is_success:
+            try:
+                self.router._save_routing_memory(user_input, route_plan)
+            except Exception:
+                pass
+
+        # 保存会话记录（用于跨轮次上下文感知）
+        try:
+            if self._session_store is None:
+                self._session_store = SessionStore()
+            record = new_session_record(
+                user_input=user_input,
+                route_plan=route_plan.to_dict(),
+                task_results=[
+                    {
+                        "agent": r.task.agent,
+                        "task": r.task.task,
+                        "success": r.success,
+                        "output": r.output[:200],
+                        "error": r.error[:200],
+                        "duration_ms": r.duration_ms,
+                    }
+                    for r in result.task_results
+                ],
+                aggregate=result.aggregate,
+                duration_ms=result.total_duration_ms,
+            )
+            self._session_store.save(record)
+        except Exception:
+            logger.debug("保存会话记录失败", exc_info=True)
+
         return result
 
     def _load_agents(self) -> dict[str, AgentManifest]:
@@ -749,6 +809,76 @@ class AgentScheduler:
 
         else:
             return f"Unknown action: {action}. Available: start, stop, restart, status"
+
+    # ── Cron 集成 ──────────────────────────────────────────────
+
+    def _start_cron_if_needed(self) -> None:
+        """如 .agent_hub/cron_jobs.json 存在且有任务，则启动 cron 循环。"""
+        if self._cron is not None:
+            return  # 已启动
+
+        self._cron = CronScheduler()
+        if not self._cron.list_jobs():
+            return  # 无定时任务，不启动循环
+
+        asyncio.create_task(
+            self._cron.start_loop(self._execute_cron_job),
+            name="cron-scheduler-bg",
+        )
+        logger.info("Cron 调度器已自动启动 (%d 个任务)", len(self._cron.list_jobs()))
+
+    async def _execute_cron_job(self, job: CronJob) -> CronRunRecord:
+        """执行单个定时任务（cron 回调）。"""
+        import time as _time
+        start = _time.monotonic()
+
+        # 构造 RoutedTask
+        task = RoutedTask(
+            id=0,
+            agent=job.agent,
+            task=job.task,
+            description=f"定时任务: {job.name}",
+            params=job.params,
+            depends_on=[],
+        )
+
+        try:
+            # 加载 agents 并执行
+            agents = self._load_agents()
+            if job.agent not in agents:
+                return CronRunRecord(
+                    job_name=job.name,
+                    agent=job.agent,
+                    task=job.task,
+                    success=False,
+                    error=f"Agent '{job.agent}' 未注册",
+                    duration_ms=(_time.monotonic() - start) * 1000,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
+
+            result = await self._execute_single_task(task, agents, dash=None)
+
+            return CronRunRecord(
+                job_name=job.name,
+                agent=job.agent,
+                task=job.task,
+                success=result.success,
+                output=result.output[:500],
+                error=result.error[:500],
+                duration_ms=result.duration_ms,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+
+        except Exception as e:
+            return CronRunRecord(
+                job_name=job.name,
+                agent=job.agent,
+                task=job.task,
+                success=False,
+                error=str(e),
+                duration_ms=(_time.monotonic() - start) * 1000,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
 
     # ── 便捷方法 ─────────────────────────────────────────────────
 

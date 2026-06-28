@@ -66,6 +66,10 @@ class RoutePlan:
     tasks: list[RoutedTask]
     analysis: str = ""  # 意图分析摘要
     is_parallel: bool = False  # 是否有可并行的任务
+    confidence: float = 1.0  # 路由置信度 (0.0-1.0)，LLM 输出或规则回退估算
+
+    # 低于此阈值时 CLI 会要求用户确认
+    CONFIDENCE_WARN_THRESHOLD = 0.7
 
     @property
     def task_count(self) -> int:
@@ -75,11 +79,17 @@ class RoutePlan:
     def agents_involved(self) -> list[str]:
         return sorted(set(t.agent for t in self.tasks))
 
+    @property
+    def is_low_confidence(self) -> bool:
+        """是否为低置信度路由（需要用户确认）。"""
+        return self.confidence < self.CONFIDENCE_WARN_THRESHOLD
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "tasks": [t.to_dict() for t in self.tasks],
             "analysis": self.analysis,
             "is_parallel": self.is_parallel,
+            "confidence": self.confidence,
             "agents_involved": self.agents_involved,
         }
 
@@ -116,6 +126,7 @@ class IntentRouter:
 ```json
 {{
   "analysis": "简要分析用户意图（1-2句话，中文）",
+  "confidence": 0.85,
   "tasks": [
     {{
       "id": 1,
@@ -145,7 +156,8 @@ class IntentRouter:
 4. **depends_on** 标注该步骤依赖的前序步骤 ID 列表（无依赖则 []）
 5. 可以独立执行的步骤标记为 depends_on: [] — 它们将被并行执行
 6. 如果一个 Agent 无法完成用户请求，在 analysis 中说明原因，返回空 tasks
-7. 只输出 JSON，不要输出其他文本"""
+7. confidence 值为 0.0-1.0，表示你对该路由方案的信心。简单明确的任务（如"列出 agent"）给 0.9+，模糊或跨多个领域的任务给 0.6-0.8。当用户输入和所有 Agent 的任务描述都不太匹配时给 < 0.5
+8. 只输出 JSON，不要输出其他文本"""
 
     def __init__(
         self,
@@ -162,6 +174,7 @@ class IntentRouter:
         agents: dict[str, AgentManifest],
         *,
         extra_context: str = "",
+        session_context: str = "",
     ) -> RoutePlan:
         """分析用户意图并生成跨 Agent 任务 DAG。
 
@@ -169,6 +182,7 @@ class IntentRouter:
             user_input: 用户自然语言输入
             agents: 可用 Agent 字典 {name: AgentManifest}
             extra_context: 额外上下文（如对话历史）
+            session_context: 最近 N 轮的会话历史（由 SessionStore 生成）
 
         Returns:
             RoutePlan 包含分解后的任务列表
@@ -179,11 +193,30 @@ class IntentRouter:
                 analysis="未发现任何 Agent。请先注册: agent register <项目路径>",
             )
 
+        # 路由记忆优先：检查是否有相同/相似的历史请求（跳过 LLM 调用）
+        cached_plan = self._check_routing_memory(user_input)
+        if cached_plan and cached_plan.tasks:
+            # 验证缓存的 Agent 仍然可用
+            if all(t.agent in agents for t in cached_plan.tasks):
+                logger.info("使用缓存路由（路由记忆命中）: %s", user_input[:60])
+                return cached_plan
+            else:
+                logger.info("缓存路由中的 Agent 不再可用，忽略记忆")
+
         # 构建 Agent 描述 → system prompt
         agent_descriptions = self._build_agent_descriptions(agents)
 
         # 优化用户输入：添加任务映射指引
         optimized_input = self._optimize_input(user_input, agents)
+
+        # 注入会话上下文（用于指代消解："继续"、"再"、"也"）
+        if session_context:
+            optimized_input = (
+                f"## 最近的会话历史\n"
+                f"{session_context}\n\n"
+                f"## 当前请求\n"
+                f"{optimized_input}"
+            )
 
         # 调用 LLM 进行意图路由
         messages = [
@@ -289,6 +322,10 @@ class IntentRouter:
         analysis = str(data.get("analysis", ""))
         raw_tasks = data.get("tasks", [])
 
+        # 提取置信度：LLM 输出的 confidence，未提供则根据任务匹配度估算
+        confidence = float(data.get("confidence", 0.7))
+        confidence = max(0.0, min(1.0, confidence))  # 钳制在 [0, 1]
+
         tasks = [RoutedTask.from_dict(t) for t in raw_tasks if isinstance(t, dict)]
 
         # 检测并行性
@@ -300,6 +337,7 @@ class IntentRouter:
             tasks=tasks,
             analysis=analysis,
             is_parallel=has_parallel,
+            confidence=confidence,
         )
 
     # ── 验证与补充 ──────────────────────────────────────────────
@@ -451,7 +489,127 @@ class IntentRouter:
             tasks=selected,
             analysis=f"规则回退路由：根据关键词匹配选择了 {len(selected)} 个 Agent",
             is_parallel=len(selected) > 1 and all(not t.depends_on for t in selected),
+            confidence=0.3,  # 规则回退的置信度远低于 LLM 路由
         )
+
+    # ── 路由记忆 ─────────────────────────────────────────────────
+
+    def _get_routing_memory_path(self) -> Path:
+        """获取路由记忆文件路径。"""
+        from pathlib import Path as _Path
+        return _Path(__file__).parent.parent / ".agent_hub" / "routing_memory.json"
+
+    def _check_routing_memory(self, user_input: str) -> RoutePlan | None:
+        """检查路由记忆中是否有匹配的历史请求。
+
+        简单子串匹配 — 若用户输入与某条记忆的 pattern 高度重叠，直接返回缓存路由。
+        这既能加速常见操作，也能应用用户之前纠正过的路由。
+
+        Returns:
+            匹配的 RoutePlan，或 None（未命中）
+        """
+        try:
+            mem_path = self._get_routing_memory_path()
+            if not mem_path.exists():
+                return None
+
+            import json as _json
+            memories = _json.loads(mem_path.read_text(encoding="utf-8"))
+            if not isinstance(memories, list):
+                return None
+
+            user_lower = user_input.lower().strip()
+
+            for mem in memories:
+                pattern = str(mem.get("pattern", "")).lower().strip()
+                if not pattern:
+                    continue
+
+                # 精确匹配或高重叠子串匹配（pattern 长度 > 5 且包含在用户输入中）
+                if pattern == user_lower or (
+                    len(pattern) > 5 and pattern in user_lower
+                ):
+                    agent = str(mem.get("agent", ""))
+                    task = str(mem.get("task", ""))
+                    if not agent or not task:
+                        continue
+
+                    logger.info(
+                        "路由记忆命中: '%s' → %s.%s", user_input[:60], agent, task,
+                    )
+                    return RoutePlan(
+                        tasks=[
+                            RoutedTask(
+                                id=1,
+                                agent=agent,
+                                task=task,
+                                description=str(mem.get("description", task)),
+                                params=mem.get("params", {"goal": user_input}),
+                                depends_on=[],
+                            )
+                        ],
+                        analysis=f"根据历史路由记录匹配: {mem.get('saved_at', '')}",
+                        confidence=0.9,  # 用户之前确认过的路由，置信度高
+                    )
+
+        except Exception as e:
+            logger.debug("路由记忆检查失败: %s", e)
+
+        return None
+
+    def _save_routing_memory(
+        self,
+        user_input: str,
+        route_plan: RoutePlan,
+    ) -> None:
+        """保存路由决策到记忆（用户确认后调用）。"""
+        try:
+            mem_path = self._get_routing_memory_path()
+            mem_path.parent.mkdir(parents=True, exist_ok=True)
+
+            import json as _json
+            from datetime import datetime as _dt, timezone as _tz
+
+            memories: list[dict] = []
+            if mem_path.exists():
+                memories = _json.loads(mem_path.read_text(encoding="utf-8"))
+                if not isinstance(memories, list):
+                    memories = []
+
+            # 每个任务保存一条记忆（简化：只存第一个任务）
+            for task in route_plan.tasks[:1]:
+                # 检查是否已有相同 pattern（避免重复）
+                pattern = user_input.strip()
+                exists = any(
+                    m.get("pattern", "").strip() == pattern
+                    and m.get("agent") == task.agent
+                    and m.get("task") == task.task
+                    for m in memories
+                )
+                if exists:
+                    continue
+
+                memories.append({
+                    "pattern": pattern,
+                    "agent": task.agent,
+                    "task": task.task,
+                    "description": task.description,
+                    "params": task.params,
+                    "saved_at": _dt.now(_tz.utc).isoformat(),
+                })
+
+            # 限制最多 50 条记忆
+            if len(memories) > 50:
+                memories = memories[-50:]
+
+            mem_path.write_text(
+                _json.dumps(memories, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.info("路由记忆已保存: '%s' → %s.%s", user_input[:60], route_plan.tasks[0].agent if route_plan.tasks else "?", route_plan.tasks[0].task if route_plan.tasks else "?")
+
+        except Exception as e:
+            logger.debug("保存路由记忆失败: %s", e)
 
     # ── 辅助 ─────────────────────────────────────────────────────
 

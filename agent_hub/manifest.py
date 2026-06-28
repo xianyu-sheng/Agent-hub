@@ -241,6 +241,15 @@ class AgentManifest:
         if self.protocol != "internal" and not self.interface.command:
             errors.append("interface.command 是必填字段 — 指定 CLI 调用命令")
 
+        # 警告：mcp / http 协议尚未在 CLIBridge 中实现
+        UNIMPLEMENTED = {"mcp", "http"}
+        if self.protocol in UNIMPLEMENTED:
+            logger.warning(
+                "Agent '%s' 使用尚未实现的协议 '%s'，将无法通过 CLI Bridge 执行。"
+                "当前仅支持 cli 和 internal。",
+                self.name, self.protocol,
+            )
+
         # 验证每个 task 的必填字段
         for task in self.capabilities.tasks:
             if not task.name:
