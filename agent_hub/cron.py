@@ -224,6 +224,20 @@ class CronScheduler:
 
         self._load()
 
+    @property
+    def data_dir(self) -> str:
+        """cron 数据目录（存放 jobs.json、history.json、哨兵文件）。"""
+        return str(self._jobs_path.parent)
+
+    def request_stop(self) -> None:
+        """通过哨兵文件请求正在运行的 cron 循环优雅停止。
+
+        即使调用进程与运行 cron 的进程不同，此方法也能工作。
+        """
+        stop_file = os.path.join(self.data_dir, ".cron_stop")
+        Path(stop_file).touch()
+        logger.info("已创建停止哨兵文件: %s", stop_file)
+
     # ── 持久化 ─────────────────────────────────────────────────
 
     def _load(self) -> None:
@@ -383,12 +397,27 @@ class CronScheduler:
         logger.info("Cron 调度器已启动 (间隔=%ds, %d 个任务)", interval, len(self._jobs))
 
     async def _cron_loop(self, interval: int = 30) -> None:
-        """Cron 主循环。"""
+        """Cron 主循环。每 interval 秒检查一次到期任务。
+
+        支持优雅停止：
+        - 收到 asyncio.CancelledError → 退出
+        - 检测到 {data_dir}/.cron_stop 哨兵文件 → 退出并清理文件
+        """
+        _stop_file = os.path.join(self.data_dir, ".cron_stop")
         while True:
             try:
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 logger.info("Cron 调度器已停止")
+                return
+
+            # 检查停止哨兵文件
+            if os.path.exists(_stop_file):
+                logger.info("检测到停止哨兵文件，Cron 调度器正在退出...")
+                try:
+                    os.remove(_stop_file)
+                except OSError:
+                    pass
                 return
 
             now = datetime.now(timezone.utc)

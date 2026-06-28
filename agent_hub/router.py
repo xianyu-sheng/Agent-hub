@@ -312,11 +312,21 @@ class IntentRouter:
             )
 
         # 路由记忆优先：检查是否有相同/相似的历史请求（跳过 LLM 调用）
-        cached_plan = self._check_routing_memory(user_input)
+        # 将会话上下文纳入记忆键 — 不同对话历史产生不同缓存条目
+        memory_key = user_input
+        if session_context:
+            # 取 session_context 前 200 字符的 hash 作为键后缀，确保
+            # "再列一次"在不同对话历史下可能路由到不同 Agent
+            ctx_hash = hash(session_context[:200])
+            memory_key = f"{user_input}||ctx:{ctx_hash}"
+        cached_plan = self._check_routing_memory(memory_key)
+        if not cached_plan or not cached_plan.tasks:
+            # 回退：尝试不带上下文的原始键（兼容旧记忆）
+            cached_plan = self._check_routing_memory(user_input)
         if cached_plan and cached_plan.tasks:
             # 验证缓存的 Agent 仍然可用
             if all(t.agent in agents for t in cached_plan.tasks):
-                logger.info("使用缓存路由（路由记忆命中）: %s", user_input[:60])
+                logger.info("使用缓存路由（路由记忆命中）: %s", memory_key[:60])
                 return cached_plan
             else:
                 logger.info("缓存路由中的 Agent 不再可用，忽略记忆")

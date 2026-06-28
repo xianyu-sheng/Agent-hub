@@ -23,16 +23,9 @@ import os
 import sys
 from pathlib import Path
 
-# ── Windows UTF-8 编码修复 ──────────────────────────────────────────
-# Rich 在 Windows GBK 终端下输出 emoji 会触发 UnicodeEncodeError
-if sys.platform == "win32":
-    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-    os.environ.setdefault("PYTHONUTF8", "1")
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+from agent_hub import ensure_utf8
+
+ensure_utf8()
 
 import click
 from rich.console import Console
@@ -1496,6 +1489,20 @@ def schedule_history(limit: int):
         )
 
     console.print(table)
+
+
+@schedule.command("stop")
+def schedule_stop():
+    """停止正在运行的 Cron 定时调度器。
+
+    通过哨兵文件通知后台 cron 循环优雅退出。
+    """
+    from agent_hub.cron import CronScheduler
+
+    cs = CronScheduler()
+    cs.request_stop()
+    console.print("[green]✅ 已发送停止信号[/green]")
+    console.print("  Cron 调度器将在下个检查周期（最多 30 秒）内停止。")
 
 
 # ── run ──────────────────────────────────────────────────────────────

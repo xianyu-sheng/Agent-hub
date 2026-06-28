@@ -532,12 +532,6 @@ class CLIBridge:
         """
         template = manifest.interface.command
         raw_goal = str(params.get("goal", params.get("task_description", "")))
-        goal = self._sanitize_goal(raw_goal, self._MAX_GOAL_LENGTH)
-        if len(raw_goal) > self._MAX_GOAL_LENGTH:
-            logger.debug(
-                "Goal 从 %d 字符截断至 %d: %s...",
-                len(raw_goal), len(goal), goal[:80],
-            )
         mode = str(params.get("mode", "react"))
         project = str(params.get("project", params.get("project_path", "")))
 
@@ -553,13 +547,9 @@ class CLIBridge:
             project = ""
 
         # 文件路径 → 项目目录转换
-        # 某些 Agent（如 smartbench）的 --project 参数要求目录而非文件，
-        # 传入 scheduler.py 会导致 resolve_project_path().is_dir() 失败。
         project = self._ensure_project_dir(project)
 
         # 项目路径 → 项目名转换（用于 resume-sync 等按名称索引的 Agent）
-        # 如果模板使用 {project} 作为位置参数（而非 --project {project}），
-        # 则提取路径的最后一个组件作为项目名。
         if project and "{project}" in template:
             if "--project" not in template and "-p " not in template:
                 import os as _os
@@ -570,18 +560,17 @@ class CLIBridge:
                     )
                     project = project_name
 
-        # 注入 Pipeline 上下文：前序波次的结果摘要拼接到 goal 末尾
+        # 注入 Pipeline 上下文 — 在所有拼接完成后统一截断
         pipeline_ctx = str(params.get("_pipeline_context", ""))
         if pipeline_ctx:
             raw_goal = f"{raw_goal}\n\n{pipeline_ctx}"
-            goal = self._sanitize_goal(raw_goal, self._MAX_GOAL_LENGTH * 3)
-        else:
-            goal = self._sanitize_goal(raw_goal, self._MAX_GOAL_LENGTH)
 
-        if len(raw_goal) > self._MAX_GOAL_LENGTH and not pipeline_ctx:
+        max_len = self._MAX_GOAL_LENGTH * 3 if pipeline_ctx else self._MAX_GOAL_LENGTH
+        goal = self._sanitize_goal(raw_goal, max_len)
+        if len(raw_goal) > max_len:
             logger.debug(
-                "Goal 从 %d 字符截断至 %d: %s...",
-                len(raw_goal), len(goal), goal[:80],
+                "Goal 从 %d 字符截断至 %d (max=%d)",
+                len(raw_goal), len(goal), max_len,
             )
 
         command_str = template.replace("{task}", task_name)
@@ -763,6 +752,12 @@ class CLIBridge:
             info.last_restart_time = time.monotonic()
             # 保存 stdout 回调，供 Watchdog 自动重启时复用
             self._watchdog_stdout_cb = on_stdout
+            # 同步 PidFileStore — 确保 agent-hub stop 能发现此进程
+            try:
+                from agent_hub.pid_store import PidFileStore
+                PidFileStore().save(name, process.pid, manifest.protocol)
+            except Exception:
+                pass
             logger.info("Agent %s 启动成功 (pid=%d)", name, process.pid)
             return info
 
@@ -921,6 +916,12 @@ class CLIBridge:
                 info.desired_state = "stopped"  # Watchdog: 用户主动停止，不再自动重启
                 info.restart_count = 0
             self.registry.remove(name)
+            # 同步 PidFileStore — 确保 agent-hub stop 也能清理此进程
+            try:
+                from agent_hub.pid_store import PidFileStore
+                PidFileStore().remove(name)
+            except Exception:
+                pass
             logger.info("Agent %s 已停止", name)
             return True
 
