@@ -2,9 +2,11 @@
 
 <p align="center">
   <strong>直接输入自然语言，自动路由到专业 Agent 协同工作</strong>
+  <br>
+  <em>7 种协作策略 · 有记忆的调度系统 · 定时自主运行</em>
 </p>
 
-Agent Hub 是一个**解耦的多 Agent 中央调度系统**。通过 `agent.yaml` 自描述清单发现专业 Agent，利用 LLM 意图路由将用户自然语言任务分解为跨 Agent 的 DAG，并行调度执行，并在终端中以 Rich TUI 仪表盘实时展示。
+Agent Hub 是一个**解耦的多 Agent 中央调度系统**。通过 `agent.yaml` 自描述清单发现专业 Agent，利用 LLM 意图路由将用户自然语言任务分解为跨 Agent 的 DAG，根据**协作策略**（辩论/反思/投票/人机协同...）执行调度，并在终端中以 Rich TUI 仪表盘实时展示。
 
 **核心理念**：不是再做一个 Agent，而是设计一套让多个专业 Agent **协同工作**的系统——Agent Hub 是粘合剂，专业 Agent 是积木。
 
@@ -184,10 +186,21 @@ agent-hub stop                    # 停止通过 start 启动的进程
 agent-hub status                  # 查看运行状态
 ```
 
+### 定时调度
+
+```bash
+agent-hub schedule list                              # 列出所有定时任务
+agent-hub schedule add <name> \                      # 添加定时任务
+  --cron "0 9 * * 1-5" --agent <agent> --task <task>
+agent-hub schedule remove [name]                     # 删除定时任务
+agent-hub schedule run [name]                        # 手动触发一次
+agent-hub schedule history                           # 查看执行历史 (最近 20 条)
+```
+
 ### 任务执行
 
 ```bash
-agent-hub run "分析代码并更新简历"  # 带仪表盘的多 Agent 调度
+agent-hub run "分析代码并更新简历"  # 带仪表盘的多 Agent 调度（自动选择协作策略）
 agent-hub run --no-dashboard "..." # 纯命令行模式
 agent-hub run                      # 交互式任务模式
 ```
@@ -303,14 +316,16 @@ scheduled_agents:
 
 ```
 agent_hub/
-├── __init__.py          # 版本 0.1.0
+├── __init__.py          # 版本 0.2.0
 ├── manifest.py          # AgentManifest 数据模型 + YAML 加载 + Agent 发现
-├── bridge.py            # CLI Bridge 子进程调用 + Agent 生命周期管理
-├── router.py            # LLM 意图路由 + 输入优化器
-├── scheduler.py         # 中央调度器：发现 → 路由 → DAG 执行 → 汇总
-├── dashboard.py         # Rich TUI 仪表盘 (AgentDashboard + StartDashboard)
+├── bridge.py            # CLI Bridge 子进程调用 + Agent 生命周期 + Watchdog 自愈
+├── router.py            # LLM 意图路由 + 输入优化 + 协作策略推断 + 路由记忆
+├── scheduler.py         # 中央调度器：策略分派 → DAG 执行 → 循环控制 → 汇总
+├── dashboard.py         # Rich TUI 仪表盘 (AgentDashboard + HealthDashboard)
 ├── llm.py               # 异步 OpenAI-compatible chat completion 客户端
 ├── model_config.py      # 模型配置管理 (models.yaml CRUD + 就绪检查)
+├── session_store.py     # 跨轮次会话记忆 (上下文注入 + 指代消解)
+├── cron.py              # 定时调度引擎 (5 字段 cron + 执行历史)
 ├── pid_store.py         # 跨 CLI 调用的进程状态持久化
 └── cli.py               # Click 命令行入口 + 交互式 REPL
 ```
@@ -318,32 +333,61 @@ agent_hub/
 ### 调度流水线
 
 ```
-用户输入 "分析代码质量并更新简历"
+用户输入 "将 omniagent 代码质量提升到 A 级"
     │
     ▼
 ┌───────────────────┐
-│ 0. 就绪检查        │  ← check_system_ready() — 模型+Key 是否可用
+│ 0. 会话上下文注入  │  ← SessionStore.get_recent_context(3) — 最近 3 轮历史
 ├───────────────────┤
-│ 1. Agent 发现      │  ← 扫描 agents.d/*.yaml → 加载 agent.yaml
+│ 1. 就绪检查        │  ← check_system_ready() — 模型+Key 是否可用
 ├───────────────────┤
-│ 2. 输入优化 (LLM)  │  ← Prompt Optimizer 丰富任务映射指引
+│ 2. Agent 发现      │  ← 扫描 agents.d/*.yaml → 加载 agent.yaml
 ├───────────────────┤
-│ 3. 意图路由 (LLM)  │  ← 分解为跨 Agent DAG
+│ 3. 路由记忆检查    │  ← routing_memory.json — 相同请求跳过 LLM
 ├───────────────────┤
-│ 4. DAG 波次计算    │  ← Kahn 拓扑排序 → 并行波次
+│ 4. 意图路由 (LLM)  │  ← 分解为跨 Agent DAG + 推断协作策略 + 置信度
 ├───────────────────┤
-│ 5. 并行执行        │  ← asyncio.gather + CLI Bridge 子进程
+│ 5. 策略分派        │  ← 根据 strategy 选择执行模式
+│   ├─ fan_out       │     并行分派 → 汇总
+│   ├─ debate        │     A诊断 → B修复 → 循环直到通过阈值
+│   ├─ reflection    │     执行 → 自审 → 改进（循环）
+│   ├─ vote          │     多模型并发 → 比较差异 → 选最佳
+│   ├─ plan_execute  │     先规划 → 按步执行 → 失败重规划
+│   └─ hitl          │     逐任务执行 → 审批关卡暂停等人类确认
 ├───────────────────┤
-│ 6. LLM 汇总        │  ← 整合多 Agent 输出 → 连贯结论
+│ 6. DAG 波次/循环   │  ← Kahn 拓扑排序 (fan_out) 或 迭代循环 (debate/reflection)
+├───────────────────┤
+│ 7. LLM 汇总        │  ← 整合多 Agent 输出 → 连贯结论
+├───────────────────┤
+│ 8. 会话保存        │  ← 保存到 .agent_hub/sessions/ + 高置信度路由记忆
 └───────────────────┘
 ```
+
+### 协作策略
+
+Agent Hub 不只是把任务分派给 Agent，它根据任务性质**自动选择协作模式**：
+
+| 策略 | 触发场景 | 工作方式 |
+|------|---------|---------|
+| **fan_out** `并行分派` | 独立任务、信息查询 | 并行执行 → LLM 汇总（默认） |
+| **debate** `辩论-修复` | "提升/优化/修复" | A 诊断 → B 修复 → A 再诊断 → 循环直到通过阈值 |
+| **reflection** `自反思` | "写/创作/生成" | 执行 → 自审查 → 改进 → 循环 |
+| **vote** `多视角投票` | "评估/对比/审查" | 同一问题 → 多模型 → 比较差异 → 选最佳 |
+| **plan_execute** `规划-执行` | "实现/开发/构建" | 先规划分步 → 按步执行 → 失败自动重规划 |
+| **hitl** `人机协同` | "部署/推送/发布" | 关键步骤暂停等人类 [Y]批准 [n]拒绝 [r]重试 |
+| **pipeline** `串行管线` | 有严格先后依赖 | A→B→C 串行执行 |
+
+**策略由 LLM 路由器自动推断**，用户无需指定。若 LLM 未指定策略，系统根据关键词自动回退选择（`CollaborationStrategy.default_for()`）。
 
 ### 智能路由
 
 - **输入优化**：自动追加精确任务名索引，防止 LLM 臆造不存在的任务
+- **协作策略推断**：LLM 分析任务性质 → 自动选择最佳协作模式（debate/reflection/vote...）
+- **路由记忆**：相同请求命中时跳过 LLM，直接使用缓存路由（`routing_memory.json`）
+- **置信度门禁**：路由置信度 < 0.7 时显示警告，防止错误路由静默执行
 - **模糊匹配**：LLM 输出的任务名自动修正到最接近的实际任务
-- **规则回退**：LLM 不可用时基于关键词的规则路由
-- **依赖自动清理**：移除无效的 depends_on 引用
+- **规则回退**：LLM 不可用时的规则路由（confidence=0.3）+ 自动策略检测
+- **退出条件**：循环策略支持 `score >= 90`、`pass_rate > 0.9` 等表达式求值
 
 ---
 
@@ -351,8 +395,70 @@ agent_hub/
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/ -v           # 30 tests
+pytest tests/ -v           # 30 tests (manifest 协议全覆盖 + 真实项目 agent.yaml 验证)
 ```
+
+---
+
+---
+
+## 🔧 高级特性
+
+### 会话记忆（Session Memory）
+
+Agent Hub 自动记住每次调度的上下文，实现**跨轮次感知**：
+
+```
+agent-hub > 列出所有 agent
+→ 路由: agent-hub.discover_capabilities → 发现 4 个 Agent
+
+agent-hub > 再列一次    ← "再"被正确理解为指代上一轮
+→ 读取 SessionStore 上下文 → 路由到相同任务
+```
+
+- 每轮调度自动保存到 `.agent_hub/sessions/`（JSON）
+- 最近 3 轮上下文注入 LLM 路由 prompt，实现指代消解
+- 自动清理最旧的会话文件（保留 50 轮）
+
+### 路由反馈闭环（Routing Feedback）
+
+路由错误可持续改进：
+
+- **置信度门禁**：路由置信度 < 70% 时显示警告 + 路由分析
+- **路由记忆**：用户确认的高置信度路由自动保存到 `routing_memory.json`
+- **记忆优先**：相同请求命中时跳过 LLM 调用，直接使用缓存路由（confidence=0.9）
+- **规则回退增强**：LLM 不可用时自动检测协作策略 + 检查路由记忆
+
+### Agent 健康自愈（Watchdog）
+
+Agent 进程异常退出后**自动重启**：
+
+- 每 15 秒扫描注册表，发现 `desired_state == "running"` 但进程已退出 → 自动重启
+- 5 分钟内最多重启 3 次（防止无限重启循环）
+- 超过限制 → 标记为 `failed` + 日志告警
+- `agent-hub stop` 主动停止 → 设置 `desired_state = "stopped"` → 不会自动重启
+
+### 定时调度（Cron Scheduler）
+
+Agent Hub 可以**自主定时执行任务**，无需人工触发：
+
+```bash
+# 每个工作日早上 9 点自动诊断代码质量
+agent-hub schedule add daily-check \
+  --cron "0 9 * * 1-5" \
+  --agent smartbench \
+  --task diagnose_code \
+  --params '{"project": "omniagent"}'
+
+# 查看任务和执行历史
+agent-hub schedule list
+agent-hub schedule history
+```
+
+- 纯 Python cron 引擎（零外部依赖）
+- 支持标准 5 字段 cron：`*`、`*/N`、`1-5`、`0,30`
+- 执行历史持久化到 `.agent_hub/cron_history.json`
+- 调度器启动时自动加载并运行 cron 循环
 
 ---
 
@@ -390,20 +496,31 @@ agent-hub run "写一个 Python 快速排序函数"
 
 ## 🗺️ 路线图
 
+### 已完成
+
 - [x] Agent Manifest 协议 (agent.yaml)
-- [x] CLI Bridge + Agent 生命周期管理
-- [x] LLM 意图路由 → 跨 Agent DAG
+- [x] CLI Bridge + Agent 生命周期管理 + Watchdog 自愈
+- [x] LLM 意图路由 → 跨 Agent DAG + 协作策略推断
 - [x] 输入优化器 (Prompt Optimizer)
 - [x] Rich TUI 仪表盘 (AgentDashboard + StartDashboard)
-- [x] DAG 并行调度 (Kahn 波次)
+- [x] DAG 并行调度 (Kahn 波次) + 循环策略引擎
 - [x] 交互式 REPL (agent-hub 默认命令)
 - [x] 自然语言自动路由（无需 run 前缀）
 - [x] 模型配置管理 (models add/remove/list/update/priority)
 - [x] 就绪检查 + 用户友好错误指引
-- [x] SmartBench 外部 Agent 调度验证
-- [ ] MCP/HTTP 协议支持
-- [ ] Agent 健康检查自动重启
-- [ ] 任务执行历史持久化
+- [x] 跨轮次会话记忆 (SessionStore + 上下文注入)
+- [x] 路由反馈闭环 (置信度门禁 + routing_memory)
+- [x] 7 种协作策略 (fan_out/debate/reflection/vote/plan_execute/hitl/pipeline)
+- [x] 定时调度 (cron 引擎 + schedule 命令组)
+- [x] Agent 健康自愈 (Watchdog 自动重启)
+- [x] 协议完整性 (mcp/http 预留 + 防御性错误信息)
+
+### 规划中
+
+- [ ] MCP/HTTP 协议实现
+- [ ] Agent 间直接通信（不经过 Hub 汇总）
+- [ ] 多用户会话隔离
+- [ ] Web Dashboard
 
 ---
 
