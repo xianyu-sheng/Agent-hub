@@ -1275,6 +1275,10 @@ class AgentScheduler:
         return TaskExecutionResult(
             task=task,
             success=result.success,
+            output=result.output,
+            error=result.error,
+            duration_ms=result.duration_ms,
+        )
 
     async def _execute_single_task_throttled(
         self,
@@ -1288,10 +1292,6 @@ class AgentScheduler:
         """
         async with self._concurrency_sem:
             return await self._execute_single_task(task, agents, dash)
-            output=result.output,
-            error=result.error,
-            duration_ms=result.duration_ms,
-        )
 
     async def _run_internal_task(
         self,
