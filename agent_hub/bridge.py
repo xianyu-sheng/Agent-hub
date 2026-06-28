@@ -66,6 +66,13 @@ class ProcessInfo:
     status: str = "stopped"  # starting | running | stopping | stopped | failed
     started_at: float = 0.0
     pid: int = 0
+    desired_state: str = "stopped"  # running | stopped — 用户期望的状态（用于 Watchdog 判断）
+    restart_count: int = 0          # 本次会话内累计重启次数
+    last_restart_time: float = 0.0  # 上次重启的时间戳（monotonic）
+
+    # Watchdog 限制常量
+    MAX_RESTARTS = 3                # 5 分钟内最多重启次数
+    RESTART_WINDOW = 300.0          # 重启计数窗口（秒）
 
     @property
     def is_running(self) -> bool:
@@ -76,6 +83,15 @@ class ProcessInfo:
         if self.started_at <= 0:
             return 0.0
         return time.monotonic() - self.started_at
+
+    @property
+    def can_restart(self) -> bool:
+        """是否还允许自动重启（未超过窗口内最大次数）。"""
+        now = time.monotonic()
+        if now - self.last_restart_time > self.RESTART_WINDOW:
+            # 窗口外 — 重置计数
+            return True  # 允许重启（调用处会重置计数）
+        return self.restart_count < self.MAX_RESTARTS
 
 
 # ── Agent 进程注册表 ────────────────────────────────────────────────
@@ -235,6 +251,21 @@ class CLIBridge:
                     f"Agent '{manifest.name}' 使用 internal 协议，"
                     f"不能通过 CLI Bridge 子进程执行。"
                     f"任务 '{task_name}' 应由 AgentScheduler 在进程内分派。"
+                ),
+            )
+
+        # 未实现协议防御：mcp / http 协议尚未实现，此处拦截防止静默失败。
+        # 当这些协议实现时（如 MCPBridge / HTTPBridge），移除此检查即可。
+        UNSUPPORTED = {"mcp", "http"}
+        if manifest.protocol in UNSUPPORTED:
+            return AgentResult(
+                agent_name=manifest.name,
+                task_name=task_name,
+                success=False,
+                error=(
+                    f"协议 '{manifest.protocol}' 尚未实现。"
+                    f"当前仅支持 cli 和 internal 协议。"
+                    f"Agent '{manifest.name}' 的任务 '{task_name}' 无法通过 CLI Bridge 执行。"
                 ),
             )
 
@@ -598,6 +629,9 @@ class CLIBridge:
                 return info
 
             info.status = "running"
+            info.desired_state = "running"  # Watchdog: 标记用户期望此 Agent 保持运行
+            info.restart_count = 0           # 手动启动 → 重置重启计数
+            info.last_restart_time = time.monotonic()
             logger.info("Agent %s 启动成功 (pid=%d)", name, process.pid)
             return info
 
@@ -752,6 +786,9 @@ class CLIBridge:
                     pass
 
             self.registry.update_status(name, "stopped")
+            if info:
+                info.desired_state = "stopped"  # Watchdog: 用户主动停止，不再自动重启
+                info.restart_count = 0
             self.registry.remove(name)
             logger.info("Agent %s 已停止", name)
             return True
@@ -809,3 +846,97 @@ class CLIBridge:
         # 并行停止
         tasks = [self.stop_agent(name) for name in names]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ── Watchdog — Agent 健康自愈 ──────────────────────────────────
+
+    def start_watchdog(self, interval: int = 15) -> None:
+        """启动后台 Watchdog 任务（自动重启异常退出的 Agent）。
+
+        仅启动一次：若已有 Watchdog 在运行则跳过。
+        """
+        existing = getattr(self, "_watchdog_task", None)
+        if existing and not existing.done():
+            logger.debug("Watchdog 已在运行，跳过重复启动")
+            return
+
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog_loop(interval),
+            name="agent-watchdog",
+        )
+        logger.info("Watchdog 已启动 (间隔=%ds)", interval)
+
+    async def _watchdog_loop(self, interval: int = 15) -> None:
+        """Watchdog 主循环 — 定期检查并自动重启异常退出的 Agent。
+
+        每 `interval` 秒扫描一次注册表：
+        - desired_state == "running" 但 status 为 stopped/failed → 自动重启
+        - 5 分钟内最多重启 MAX_RESTARTS 次 → 超过则标记 failed 并停止尝试
+        """
+        while True:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                logger.info("Watchdog 已停止")
+                return
+
+            for name, info in list(self.registry._processes.items()):
+                # 仅处理用户期望运行但状态异常的 Agent
+                if info.desired_state != "running":
+                    continue
+                if info.status in ("running", "starting"):
+                    continue  # 健康运行中
+
+                # 需要重启 — 检查是否达到限制
+                if not info.can_restart:
+                    if info.restart_count >= info.MAX_RESTARTS:
+                        logger.error(
+                            "Agent '%s' 在 %.0fs 内崩溃 %d 次（上限 %d），"
+                            "已停止自动重启。请手动检查: agent-hub agent status",
+                            name,
+                            info.RESTART_WINDOW,
+                            info.restart_count,
+                            info.MAX_RESTARTS,
+                        )
+                        info.status = "failed"
+                    continue
+
+                # 执行自动重启
+                logger.warning(
+                    "Agent '%s' 状态=%s，尝试自动重启 (第 %d/%d 次)...",
+                    name, info.status, info.restart_count + 1, info.MAX_RESTARTS,
+                )
+
+                try:
+                    # 清理旧进程引用
+                    if info.process and info.process.returncode is None:
+                        try:
+                            info.process.kill()
+                        except Exception:
+                            pass
+
+                    # 重用 start_agent 逻辑
+                    new_info = await self.start_agent(
+                        info.manifest,
+                        on_stdout=getattr(self, "_watchdog_stdout_cb", None),
+                    )
+
+                    if new_info.status == "running":
+                        # 更新重启统计
+                        now = time.monotonic()
+                        if now - info.last_restart_time > ProcessInfo.RESTART_WINDOW:
+                            info.restart_count = 0  # 窗口外重置
+                        info.restart_count += 1
+                        info.last_restart_time = now
+                        info.status = "running"
+                        info.process = new_info.process
+                        info.pid = new_info.pid
+                        info.started_at = new_info.started_at
+                        logger.info(
+                            "Agent '%s' 自动重启成功 (pid=%d, 重启计数=%d)",
+                            name, info.pid, info.restart_count,
+                        )
+                    else:
+                        logger.error("Agent '%s' 自动重启失败: %s", name, new_info.status)
+
+                except Exception as e:
+                    logger.error("Agent '%s' 自动重启异常: %s", name, e, exc_info=True)

@@ -1266,6 +1266,218 @@ def models_priority(set_priority: str | None):
     console.print("[dim]提示: 未包含在优先级列表中的模型不会被自动使用[/dim]")
 
 
+# ── schedule 命令组 ──────────────────────────────────────────────────
+# 定时任务管理 — 配置和查看 cron 风格的 Agent 自动调度
+
+
+@main.group()
+def schedule():
+    """定时调度管理（增删改查 + 历史 + 手动触发）。"""
+    pass
+
+
+@schedule.command("list")
+def schedule_list():
+    """列出所有定时任务。"""
+    from agent_hub.cron import CronScheduler
+
+    cs = CronScheduler()
+    jobs = cs.list_jobs()
+
+    if not jobs:
+        console.print("[dim]未配置任何定时任务[/dim]")
+        console.print("[dim]添加: schedule add <name> --cron \"0 9 * * 1-5\" --agent <agent> --task <task>[/dim]")
+        return
+
+    table = Table(title="定时任务列表")
+    table.add_column("名称", style="cyan bold")
+    table.add_column("Cron", style="yellow")
+    table.add_column("Agent")
+    table.add_column("Task")
+    table.add_column("状态")
+    table.add_column("上次执行")
+
+    for job in jobs:
+        status = "🟢" if job.enabled else "⚫"
+        last = job.last_run[:19] if job.last_run else "从未"
+        table.add_row(
+            job.name,
+            job.cron,
+            job.agent,
+            job.task,
+            status,
+            last,
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]共 {len(jobs)} 个任务[/dim]")
+
+
+@schedule.command("add")
+@click.argument("name")
+@click.option("--cron", "-c", required=True, help="5 字段 cron 表达式（引号包裹），如 \"0 9 * * 1-5\"")
+@click.option("--agent", "-a", required=True, help="目标 Agent 名")
+@click.option("--task", "-t", required=True, help="要执行的任务名")
+@click.option("--params", "-p", default="{}", help="任务参数 JSON，如 '{\"project\": \"omniagent\"}'")
+def schedule_add(name: str, cron: str, agent: str, task: str, params: str):
+    """添加定时任务。
+
+    NAME: 任务唯一名称（用于后续管理）
+    """
+    import json as _json
+    from agent_hub.cron import CronScheduler, CronJob
+
+    try:
+        params_dict = _json.loads(params) if params else {}
+    except _json.JSONDecodeError:
+        console.print(f"[red]✗ params 不是合法 JSON: {params}[/red]")
+        return
+
+    cs = CronScheduler()
+
+    # 检查重名
+    if cs.get_job(name):
+        console.print(f"[red]✗ 任务 '{name}' 已存在。先删除再重新添加[/red]")
+        return
+
+    try:
+        job = CronJob(
+            name=name,
+            cron=cron,
+            agent=agent,
+            task=task,
+            params=params_dict,
+        )
+        cs.add_job(job)
+        console.print(f"[green]✅ 定时任务已添加: {name}[/green]")
+        console.print(f"   cron: [yellow]{cron}[/yellow]")
+        console.print(f"   执行: [cyan]{agent}[/cyan] {task}")
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+
+
+@schedule.command("remove")
+@click.argument("name", required=False)
+def schedule_remove(name: str | None):
+    """删除定时任务。
+
+    NAME: 任务名称，不指定则交互式选择。
+    """
+    from agent_hub.cron import CronScheduler
+    from rich.prompt import Prompt as RichPrompt
+
+    cs = CronScheduler()
+    jobs = cs.list_jobs()
+
+    if not jobs:
+        console.print("[dim]没有可删除的定时任务[/dim]")
+        return
+
+    if not name:
+        console.print()
+        console.print("[bold]可删除的任务:[/bold]")
+        for j in jobs:
+            console.print(f"  [cyan]{j.name}[/cyan] — [yellow]{j.cron}[/yellow] → {j.agent}.{j.task}")
+        console.print()
+        name = RichPrompt.ask("选择要删除的任务名")
+        if not name:
+            return
+
+    removed = cs.remove_job(name)
+    if removed:
+        console.print(f"[green]✅ 已删除: {name}[/green]")
+    else:
+        console.print(f"[yellow]任务 '{name}' 不存在[/yellow]")
+
+
+@schedule.command("run")
+@click.argument("name", required=False)
+def schedule_run(name: str | None):
+    """手动触发定时任务。
+
+    NAME: 任务名称，不指定则交互式选择。
+    """
+    import asyncio as _asyncio
+    from agent_hub.cron import CronScheduler, CronRunRecord
+    from agent_hub.scheduler import AgentScheduler
+    from rich.prompt import Prompt as RichPrompt
+
+    cs = CronScheduler()
+    jobs = cs.list_jobs()
+
+    if not jobs:
+        console.print("[dim]没有可执行的定时任务[/dim]")
+        return
+
+    if not name:
+        console.print()
+        console.print("[bold]可手动触发的任务:[/bold]")
+        for j in jobs:
+            console.print(f"  [cyan]{j.name}[/cyan] → {j.agent}.{j.task}")
+        console.print()
+        name = RichPrompt.ask("选择要执行的任务名")
+        if not name:
+            return
+
+    job = cs.get_job(name)
+    if not job:
+        console.print(f"[yellow]任务 '{name}' 不存在[/yellow]")
+        return
+
+    console.print(f"[dim]手动触发: {job.name} → {job.agent}.{job.task}...[/dim]")
+
+    async def _run():
+        scheduler = AgentScheduler(model_priority=["deepseek-v4-pro"])
+        result = await scheduler._execute_cron_job(job)
+        return result
+
+    try:
+        result = _asyncio.run(_run())
+    except Exception as e:
+        console.print(f"[red]✗ 执行失败: {e}[/red]")
+        return
+
+    icon = "✅" if result.success else "❌"
+    console.print(f"{icon} [{job.agent}] {job.task} ({result.duration_ms:.0f}ms)")
+    if result.success:
+        console.print(f"   输出: {result.output[:300]}")
+    else:
+        console.print(f"   [red]错误: {result.error[:300]}[/red]")
+
+
+@schedule.command("history")
+@click.option("--limit", "-n", default=20, help="显示最近 N 条记录")
+def schedule_history(limit: int):
+    """查看定时任务执行历史。"""
+    from agent_hub.cron import CronScheduler
+
+    cs = CronScheduler()
+    records = cs.history(limit=limit)
+
+    if not records:
+        console.print("[dim]暂无执行记录[/dim]")
+        return
+
+    table = Table(title=f"定时任务执行历史（最近 {min(limit, len(records))} 条）")
+    table.add_column("时间", style="dim")
+    table.add_column("任务", style="cyan")
+    table.add_column("Agent")
+    table.add_column("结果")
+    table.add_column("耗时")
+
+    for r in records:
+        icon = "✅" if r.success else "❌"
+        table.add_row(
+            r.timestamp[:19] if r.timestamp else "—",
+            r.job_name,
+            r.agent,
+            icon,
+            f"{r.duration_ms:.0f}ms" if r.duration_ms else "—",
+        )
+
+    console.print(table)
+
+
 # ── run ──────────────────────────────────────────────────────────────
 
 

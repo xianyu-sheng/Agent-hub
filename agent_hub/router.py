@@ -17,6 +17,56 @@ from agent_hub.manifest import AgentManifest
 
 logger = logging.getLogger(__name__)
 
+# ── 协作策略 ──────────────────────────────────────────────────────────
+
+
+class CollaborationStrategy:
+    """多 Agent 协作模式枚举。
+
+    每种策略定义了 Agent 之间如何交互、如何传递结果、何时退出。
+    Router（LLM）根据用户意图自动选择策略，用户也可以显式指定。
+    """
+
+    FAN_OUT = "fan_out"           # 并行分派 → 汇总（默认，现有的 DAG 模式）
+    PIPELINE = "pipeline"         # 严格串行链（DAG 中 depends_on 已支持）
+    DEBATE = "debate"             # A 提案 → B 批评 → A 修订 → 循环直到通过
+    REFLECTION = "reflection"     # 单 Agent 自循环：执行 → 自审 → 改进
+    PLAN_EXECUTE = "plan_execute" # 先规划分步 → 按步执行 → 失败则重规划
+    VOTE = "vote"                 # 同一问题发给多 Agent/模型 → 投票选最佳
+    HUMAN_IN_LOOP = "hitl"        # 关键步骤暂停，等待人类批准
+
+    # 所有可用策略
+    ALL = {FAN_OUT, PIPELINE, DEBATE, REFLECTION, PLAN_EXECUTE, VOTE, HUMAN_IN_LOOP}
+
+    # 循环策略（有 max_iterations 和 exit_condition）
+    LOOP_STRATEGIES = {DEBATE, REFLECTION}
+
+    # 需要人类交互的策略
+    INTERACTIVE_STRATEGIES = {HUMAN_IN_LOOP}
+
+    @classmethod
+    def is_valid(cls, strategy: str) -> bool:
+        return strategy in cls.ALL
+
+    @classmethod
+    def is_loop(cls, strategy: str) -> bool:
+        return strategy in cls.LOOP_STRATEGIES
+
+    @classmethod
+    def default_for(cls, user_input: str) -> str:
+        """根据用户输入关键词推断默认策略（LLM Router 会覆盖此默认值）。"""
+        text = user_input.lower()
+        if any(w in text for w in ("提升", "优化", "改进", "修复", "提高")):
+            return cls.DEBATE
+        if any(w in text for w in ("写", "创作", "生成", "撰写", "博客")):
+            return cls.REFLECTION
+        if any(w in text for w in ("部署", "推送", "发布", "上线")):
+            return cls.HUMAN_IN_LOOP
+        if any(w in text for w in ("评估", "决策", "对比", "安全审查")):
+            return cls.VOTE
+        return cls.FAN_OUT
+
+
 # ── 路由结果数据结构 ──────────────────────────────────────────────
 
 
@@ -61,11 +111,19 @@ class RoutedTask:
 
 @dataclass
 class RoutePlan:
-    """意图路由的完整结果 — 跨 Agent 的任务 DAG。"""
+    """意图路由的完整结果 — 跨 Agent 的任务 DAG + 协作策略。"""
 
     tasks: list[RoutedTask]
     analysis: str = ""  # 意图分析摘要
     is_parallel: bool = False  # 是否有可并行的任务
+    confidence: float = 1.0  # 路由置信度 (0.0-1.0)，LLM 输出或规则回退估算
+    strategy: str = CollaborationStrategy.FAN_OUT  # 协作策略
+    max_iterations: int = 1  # 循环策略的最大轮次（debate/reflection）
+    exit_condition: str = ""  # 循环退出条件，如 "pass_rate > 0.9"
+    approval_gates: list[int] = field(default_factory=list)  # hitl: 需人类审批的 task ID
+
+    # 低于此阈值时 CLI 会要求用户确认
+    CONFIDENCE_WARN_THRESHOLD = 0.7
 
     @property
     def task_count(self) -> int:
@@ -75,13 +133,51 @@ class RoutePlan:
     def agents_involved(self) -> list[str]:
         return sorted(set(t.agent for t in self.tasks))
 
+    @property
+    def is_low_confidence(self) -> bool:
+        """是否为低置信度路由（需要用户确认）。"""
+        return self.confidence < self.CONFIDENCE_WARN_THRESHOLD
+
+    @property
+    def is_loop_strategy(self) -> bool:
+        """是否为循环策略（需要迭代控制）。"""
+        return CollaborationStrategy.is_loop(self.strategy)
+
+    @property
+    def is_interactive(self) -> bool:
+        """是否需要人类交互。"""
+        return self.strategy in CollaborationStrategy.INTERACTIVE_STRATEGIES
+
+    @property
+    def strategy_label(self) -> str:
+        """策略的人类可读标签。"""
+        labels = {
+            CollaborationStrategy.FAN_OUT: "并行分派",
+            CollaborationStrategy.PIPELINE: "串行管线",
+            CollaborationStrategy.DEBATE: "辩论-修复循环",
+            CollaborationStrategy.REFLECTION: "自反思循环",
+            CollaborationStrategy.PLAN_EXECUTE: "先规划后执行",
+            CollaborationStrategy.VOTE: "多视角投票",
+            CollaborationStrategy.HUMAN_IN_LOOP: "人机协同",
+        }
+        return labels.get(self.strategy, self.strategy)
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "tasks": [t.to_dict() for t in self.tasks],
             "analysis": self.analysis,
             "is_parallel": self.is_parallel,
+            "confidence": self.confidence,
+            "strategy": self.strategy,
             "agents_involved": self.agents_involved,
         }
+        if self.max_iterations > 1:
+            d["max_iterations"] = self.max_iterations
+        if self.exit_condition:
+            d["exit_condition"] = self.exit_condition
+        if self.approval_gates:
+            d["approval_gates"] = self.approval_gates
+        return d
 
 
 # ── Router ──────────────────────────────────────────────────────────
@@ -116,6 +212,11 @@ class IntentRouter:
 ```json
 {{
   "analysis": "简要分析用户意图（1-2句话，中文）",
+  "confidence": 0.85,
+  "strategy": "fan_out",
+  "max_iterations": 1,
+  "exit_condition": "",
+  "approval_gates": [],
   "tasks": [
     {{
       "id": 1,
@@ -145,7 +246,18 @@ class IntentRouter:
 4. **depends_on** 标注该步骤依赖的前序步骤 ID 列表（无依赖则 []）
 5. 可以独立执行的步骤标记为 depends_on: [] — 它们将被并行执行
 6. 如果一个 Agent 无法完成用户请求，在 analysis 中说明原因，返回空 tasks
-7. 只输出 JSON，不要输出其他文本"""
+7. confidence 值为 0.0-1.0，表示你对该路由方案的信心
+8. **strategy** 必须是以下之一: fan_out, pipeline, debate, reflection, plan_execute, vote, hitl
+   - fan_out: 并行分派（默认，独立任务）
+   - debate: 两个 Agent 辩论循环（如诊断→修复→再诊断），需设 max_iterations 和 exit_condition
+   - reflection: 单 Agent 自反思循环（如写→自审→改进），需设 max_iterations
+   - plan_execute: 先规划后分步执行
+   - vote: 同一问题发多个 Agent/模型，投票选最佳
+   - hitl: 关键步骤需人类批准，approval_gates 列出需暂停的 task ID
+9. **max_iterations**: 循环策略的最大轮次（fan_out 和 pipeline 为 1）
+10. **exit_condition**: 循环退出条件，如 "score >= 90"、"pass_rate > 0.9"（非循环策略留空）
+11. **approval_gates**: 需要人类审批的 task ID 列表（仅 hitl 策略使用）
+12. 只输出 JSON，不要输出其他文本"""
 
     def __init__(
         self,
@@ -162,6 +274,7 @@ class IntentRouter:
         agents: dict[str, AgentManifest],
         *,
         extra_context: str = "",
+        session_context: str = "",
     ) -> RoutePlan:
         """分析用户意图并生成跨 Agent 任务 DAG。
 
@@ -169,6 +282,7 @@ class IntentRouter:
             user_input: 用户自然语言输入
             agents: 可用 Agent 字典 {name: AgentManifest}
             extra_context: 额外上下文（如对话历史）
+            session_context: 最近 N 轮的会话历史（由 SessionStore 生成）
 
         Returns:
             RoutePlan 包含分解后的任务列表
@@ -179,11 +293,30 @@ class IntentRouter:
                 analysis="未发现任何 Agent。请先注册: agent register <项目路径>",
             )
 
+        # 路由记忆优先：检查是否有相同/相似的历史请求（跳过 LLM 调用）
+        cached_plan = self._check_routing_memory(user_input)
+        if cached_plan and cached_plan.tasks:
+            # 验证缓存的 Agent 仍然可用
+            if all(t.agent in agents for t in cached_plan.tasks):
+                logger.info("使用缓存路由（路由记忆命中）: %s", user_input[:60])
+                return cached_plan
+            else:
+                logger.info("缓存路由中的 Agent 不再可用，忽略记忆")
+
         # 构建 Agent 描述 → system prompt
         agent_descriptions = self._build_agent_descriptions(agents)
 
         # 优化用户输入：添加任务映射指引
         optimized_input = self._optimize_input(user_input, agents)
+
+        # 注入会话上下文（用于指代消解："继续"、"再"、"也"）
+        if session_context:
+            optimized_input = (
+                f"## 最近的会话历史\n"
+                f"{session_context}\n\n"
+                f"## 当前请求\n"
+                f"{optimized_input}"
+            )
 
         # 调用 LLM 进行意图路由
         messages = [
@@ -289,6 +422,30 @@ class IntentRouter:
         analysis = str(data.get("analysis", ""))
         raw_tasks = data.get("tasks", [])
 
+        # 提取置信度：LLM 输出的 confidence，未提供则根据任务匹配度估算
+        confidence = float(data.get("confidence", 0.7))
+        confidence = max(0.0, min(1.0, confidence))  # 钳制在 [0, 1]
+
+        # 提取协作策略：LLM 未指定时用关键词推断
+        strategy = str(data.get("strategy", ""))
+        if not strategy or not CollaborationStrategy.is_valid(strategy):
+            if strategy:
+                logger.warning("LLM 输出了未知策略 '%s'，回退到自动推断", strategy)
+            strategy = CollaborationStrategy.default_for(analysis)
+            logger.info("自动推断策略: %s → %s", analysis[:60], strategy)
+
+        max_iterations = int(data.get("max_iterations", 1))
+        max_iterations = max(1, min(10, max_iterations))  # 钳制在 [1, 10]
+
+        exit_condition = str(data.get("exit_condition", "")).strip()
+
+        # 提取审批关卡
+        approval_gates_raw = data.get("approval_gates", [])
+        approval_gates = [
+            int(g) for g in (approval_gates_raw if isinstance(approval_gates_raw, list) else [])
+            if isinstance(g, (int, float))
+        ]
+
         tasks = [RoutedTask.from_dict(t) for t in raw_tasks if isinstance(t, dict)]
 
         # 检测并行性
@@ -300,6 +457,11 @@ class IntentRouter:
             tasks=tasks,
             analysis=analysis,
             is_parallel=has_parallel,
+            confidence=confidence,
+            strategy=strategy,
+            max_iterations=max_iterations,
+            exit_condition=exit_condition,
+            approval_gates=approval_gates,
         )
 
     # ── 验证与补充 ──────────────────────────────────────────────
@@ -447,11 +609,136 @@ class IntentRouter:
                     depends_on=[],
                 ))
 
+        auto_strategy = CollaborationStrategy.default_for(user_input)
         return RoutePlan(
             tasks=selected,
             analysis=f"规则回退路由：根据关键词匹配选择了 {len(selected)} 个 Agent",
             is_parallel=len(selected) > 1 and all(not t.depends_on for t in selected),
+            confidence=0.3,  # 规则回退的置信度远低于 LLM 路由
+            strategy=auto_strategy,
+            max_iterations=3 if CollaborationStrategy.is_loop(auto_strategy) else 1,
+            exit_condition="success" if CollaborationStrategy.is_loop(auto_strategy) else "",
         )
+
+    # ── 路由记忆 ─────────────────────────────────────────────────
+
+    def _get_routing_memory_path(self) -> Path:
+        """获取路由记忆文件路径。"""
+        from pathlib import Path as _Path
+        return _Path(__file__).parent.parent / ".agent_hub" / "routing_memory.json"
+
+    def _check_routing_memory(self, user_input: str) -> RoutePlan | None:
+        """检查路由记忆中是否有匹配的历史请求。
+
+        简单子串匹配 — 若用户输入与某条记忆的 pattern 高度重叠，直接返回缓存路由。
+        这既能加速常见操作，也能应用用户之前纠正过的路由。
+
+        Returns:
+            匹配的 RoutePlan，或 None（未命中）
+        """
+        try:
+            mem_path = self._get_routing_memory_path()
+            if not mem_path.exists():
+                return None
+
+            import json as _json
+            memories = _json.loads(mem_path.read_text(encoding="utf-8"))
+            if not isinstance(memories, list):
+                return None
+
+            user_lower = user_input.lower().strip()
+
+            for mem in memories:
+                pattern = str(mem.get("pattern", "")).lower().strip()
+                if not pattern:
+                    continue
+
+                # 精确匹配或高重叠子串匹配（pattern 长度 > 5 且包含在用户输入中）
+                if pattern == user_lower or (
+                    len(pattern) > 5 and pattern in user_lower
+                ):
+                    agent = str(mem.get("agent", ""))
+                    task = str(mem.get("task", ""))
+                    if not agent or not task:
+                        continue
+
+                    logger.info(
+                        "路由记忆命中: '%s' → %s.%s", user_input[:60], agent, task,
+                    )
+                    return RoutePlan(
+                        tasks=[
+                            RoutedTask(
+                                id=1,
+                                agent=agent,
+                                task=task,
+                                description=str(mem.get("description", task)),
+                                params=mem.get("params", {"goal": user_input}),
+                                depends_on=[],
+                            )
+                        ],
+                        analysis=f"根据历史路由记录匹配: {mem.get('saved_at', '')}",
+                        confidence=0.9,  # 用户之前确认过的路由，置信度高
+                    )
+
+        except Exception as e:
+            logger.debug("路由记忆检查失败: %s", e)
+
+        return None
+
+    def _save_routing_memory(
+        self,
+        user_input: str,
+        route_plan: RoutePlan,
+    ) -> None:
+        """保存路由决策到记忆（用户确认后调用）。"""
+        try:
+            mem_path = self._get_routing_memory_path()
+            mem_path.parent.mkdir(parents=True, exist_ok=True)
+
+            import json as _json
+            from datetime import datetime as _dt, timezone as _tz
+
+            memories: list[dict] = []
+            if mem_path.exists():
+                memories = _json.loads(mem_path.read_text(encoding="utf-8"))
+                if not isinstance(memories, list):
+                    memories = []
+
+            # 每个任务保存一条记忆（简化：只存第一个任务）
+            for task in route_plan.tasks[:1]:
+                # 检查是否已有相同 pattern（避免重复）
+                pattern = user_input.strip()
+                exists = any(
+                    m.get("pattern", "").strip() == pattern
+                    and m.get("agent") == task.agent
+                    and m.get("task") == task.task
+                    for m in memories
+                )
+                if exists:
+                    continue
+
+                memories.append({
+                    "pattern": pattern,
+                    "agent": task.agent,
+                    "task": task.task,
+                    "description": task.description,
+                    "params": task.params,
+                    "strategy": route_plan.strategy,
+                    "saved_at": _dt.now(_tz.utc).isoformat(),
+                })
+
+            # 限制最多 50 条记忆
+            if len(memories) > 50:
+                memories = memories[-50:]
+
+            mem_path.write_text(
+                _json.dumps(memories, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.info("路由记忆已保存: '%s' → %s.%s", user_input[:60], route_plan.tasks[0].agent if route_plan.tasks else "?", route_plan.tasks[0].task if route_plan.tasks else "?")
+
+        except Exception as e:
+            logger.debug("保存路由记忆失败: %s", e)
 
     # ── 辅助 ─────────────────────────────────────────────────────
 

@@ -23,6 +23,7 @@ import os
 import sys
 import time as time_mod
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 # ── Windows UTF-8 编码修复 ──────────────────────────────────────────
@@ -38,9 +39,11 @@ if sys.platform == "win32":
 from rich.console import Console
 
 from agent_hub.bridge import AgentProcessRegistry, CLIBridge
+from agent_hub.cron import CronJob, CronRunRecord, CronScheduler
 from agent_hub.dashboard import AgentDashboard, TaskNode
 from agent_hub.manifest import AgentManifest, discover_from_registry
-from agent_hub.router import IntentRouter, RoutePlan, RoutedTask
+from agent_hub.router import CollaborationStrategy, IntentRouter, RoutePlan, RoutedTask
+from agent_hub.session_store import SessionStore, new_session_record
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +199,8 @@ class AgentScheduler:
         self._registry: AgentProcessRegistry | None = None
         self._dashboard: AgentDashboard | None = None
         self._agents: dict[str, AgentManifest] = {}
+        self._session_store: SessionStore | None = None
+        self._cron: CronScheduler | None = None
 
     @property
     def router(self) -> IntentRouter:
@@ -261,6 +266,12 @@ class AgentScheduler:
             agents = self._load_agents()
         self._agents = agents
 
+        # 自动启动 Watchdog（仅首次，内部有去重保护）
+        self.bridge.start_watchdog()
+
+        # 自动启动 Cron 调度器（仅首次，内部有去重保护）
+        self._start_cron_if_needed()
+
         if not agents:
             return SchedulerResult(
                 user_input=user_input,
@@ -273,9 +284,18 @@ class AgentScheduler:
 
         self.console.print(f"[dim]发现 {len(agents)} 个 Agent: {', '.join(agents.keys())}[/dim]")
 
-        # Step 2: 意图路由
+        # Step 2: 意图路由（注入最近 3 轮会话上下文）
         self.console.print("[dim]🔍 分析意图...[/dim]")
-        route_plan = await self.router.route(user_input, agents)
+        session_context = ""
+        try:
+            if self._session_store is None:
+                self._session_store = SessionStore()
+            session_context = self._session_store.get_recent_context(3)
+        except Exception:
+            pass
+        route_plan = await self.router.route(
+            user_input, agents, session_context=session_context,
+        )
 
         if not route_plan.tasks:
             self.console.print(f"[yellow]⚠ {route_plan.analysis}[/yellow]")
@@ -289,15 +309,587 @@ class AgentScheduler:
             f"[dim]  路由结果: {route_plan.task_count} 个任务 "
             f"({', '.join(route_plan.agents_involved)})[/dim]"
         )
+        if route_plan.strategy != "fan_out":
+            self.console.print(
+                f"[bold cyan]  协作策略: {route_plan.strategy_label}[/bold cyan]"
+                + (f" (最多 {route_plan.max_iterations} 轮)" if route_plan.is_loop_strategy else "")
+                + (f" [审批关卡: {route_plan.approval_gates}]" if route_plan.approval_gates else "")
+            )
 
-        # Step 3-5: DAG 执行 + Dashboard + 汇总
-        if show_dashboard:
-            result = await self._execute_with_dashboard(user_input, route_plan, agents)
-        else:
-            result = await self._execute_headless(user_input, route_plan, agents)
+        # 低置信度警告
+        if route_plan.is_low_confidence:
+            self.console.print(
+                f"[yellow]⚠️  路由置信度较低 ({route_plan.confidence:.0%})[/yellow]\n"
+                f"[dim]  分析: {route_plan.analysis}[/dim]"
+            )
+
+        # Step 3-5: 根据协作策略分派执行
+        result = await self._execute_strategy(
+            user_input, route_plan, agents, show_dashboard,
+        )
 
         result.total_duration_ms = (time_mod.monotonic() - start_time) * 1000
+
+        # 高置信度路由 → 自动保存到路由记忆（加速后续相同请求）
+        if not route_plan.is_low_confidence and result.is_success:
+            try:
+                self.router._save_routing_memory(user_input, route_plan)
+            except Exception:
+                pass
+
+        # 保存会话记录（用于跨轮次上下文感知）
+        try:
+            if self._session_store is None:
+                self._session_store = SessionStore()
+            record = new_session_record(
+                user_input=user_input,
+                route_plan=route_plan.to_dict(),
+                task_results=[
+                    {
+                        "agent": r.task.agent,
+                        "task": r.task.task,
+                        "success": r.success,
+                        "output": r.output[:200],
+                        "error": r.error[:200],
+                        "duration_ms": r.duration_ms,
+                    }
+                    for r in result.task_results
+                ],
+                aggregate=result.aggregate,
+                duration_ms=result.total_duration_ms,
+            )
+            self._session_store.save(record)
+        except Exception:
+            logger.debug("保存会话记录失败", exc_info=True)
+
         return result
+
+    async def _execute_strategy(
+        self,
+        user_input: str,
+        route_plan: RoutePlan,
+        agents: dict[str, AgentManifest],
+        show_dashboard: bool,
+    ) -> SchedulerResult:
+        """根据协作策略分派到对应的执行方法。
+
+        这是策略 DSL 的执行入口。每种策略有独立的执行逻辑：
+        - fan_out / pipeline: 现有 DAG 执行（pipeline 由 depends_on 自然形成串行）
+        - debate / reflection: 循环执行（Phase 5b/5c 实现）
+        - hitl: DAG + 审批关卡（Phase 5b 实现）
+        - vote: 多 Agent 并发投票（Phase 5c 实现）
+        - plan_execute: 先规划后执行（Phase 5c 实现）
+        """
+        strategy = route_plan.strategy
+
+        if strategy == CollaborationStrategy.FAN_OUT:
+            return await self._execute_fan_out(user_input, route_plan, agents, show_dashboard)
+
+        elif strategy == CollaborationStrategy.PIPELINE:
+            # Pipeline = 严格串行 DAG（depends_on 已定义顺序）
+            return await self._execute_fan_out(user_input, route_plan, agents, show_dashboard)
+
+        elif strategy == CollaborationStrategy.DEBATE:
+            return await self._execute_debate(user_input, route_plan, agents, show_dashboard)
+
+        elif strategy == CollaborationStrategy.REFLECTION:
+            return await self._execute_reflection(user_input, route_plan, agents, show_dashboard)
+
+        elif strategy == CollaborationStrategy.VOTE:
+            return await self._execute_vote(user_input, route_plan, agents, show_dashboard)
+
+        elif strategy == CollaborationStrategy.PLAN_EXECUTE:
+            return await self._execute_plan_execute(user_input, route_plan, agents, show_dashboard)
+
+        elif strategy == CollaborationStrategy.HUMAN_IN_LOOP:
+            return await self._execute_hitl(user_input, route_plan, agents, show_dashboard)
+
+        else:
+            # 未知策略 → 回退到 fan_out
+            logger.warning("未知策略 '%s'，回退到 fan_out", strategy)
+            return await self._execute_fan_out(user_input, route_plan, agents, show_dashboard)
+
+    # ── 策略实现：fan_out / pipeline（当前 DAG 逻辑）───────────────
+
+    async def _execute_fan_out(
+        self,
+        user_input: str,
+        route_plan: RoutePlan,
+        agents: dict[str, AgentManifest],
+        show_dashboard: bool,
+    ) -> SchedulerResult:
+        """Fan-out / Pipeline 策略 — 使用现有 DAG 波次并行执行。"""
+        if show_dashboard:
+            return await self._execute_with_dashboard(user_input, route_plan, agents)
+        else:
+            return await self._execute_headless(user_input, route_plan, agents)
+
+    # ── 策略实现：debate（辩论-修复循环）─────────────────────────
+
+    async def _execute_debate(
+        self,
+        user_input: str,
+        route_plan: RoutePlan,
+        agents: dict[str, AgentManifest],
+        show_dashboard: bool,
+    ) -> SchedulerResult:
+        """Debate 策略：A 提案 → B 批评 → A 修订 → 循环直到通过阈值。
+
+        典型场景：SmartBench 诊断 → OmniAgent 修复 → SmartBench 再诊断 → ...
+        退出条件：达到 max_iterations 或 exit_condition 满足。
+        """
+        from agent_hub.router import RoutedTask
+
+        all_results: list[TaskExecutionResult] = []
+        start_time = time_mod.monotonic()
+
+        self.console.print(
+            f"[bold magenta]⚔ 辩论模式: 最多 {route_plan.max_iterations} 轮[/bold magenta]"
+        )
+
+        for iteration in range(1, route_plan.max_iterations + 1):
+            self.console.print(
+                f"\n[bold]── Round {iteration}/{route_plan.max_iterations} ──[/bold]"
+            )
+
+            # 每一轮重新执行所有 tasks（保持 depends_on 顺序）
+            # 将上一轮的结果作为 context 注入
+            enriched_plan = route_plan
+            if all_results:
+                last_outputs = "\n".join(
+                    f"[{r.task.agent}] {r.task.task}: {r.output[:300]}"
+                    for r in all_results[-len(route_plan.tasks):]
+                )
+                # 为每个 task 注入上一轮的输出作为 context
+                for task in enriched_plan.tasks:
+                    task.params["context"] = (
+                        f"上一轮输出:\n{last_outputs}\n\n"
+                        f"请基于以上反馈改进结果。"
+                    )
+                    task.params["iteration"] = iteration
+
+            # 执行当前轮
+            if show_dashboard:
+                round_result = await self._execute_with_dashboard(
+                    f"{user_input} (round {iteration})", enriched_plan, agents,
+                )
+            else:
+                round_result = await self._execute_headless(
+                    f"{user_input} (round {iteration})", enriched_plan, agents,
+                )
+
+            all_results.extend(round_result.task_results)
+
+            # 检查退出条件
+            if route_plan.exit_condition and self._check_exit_condition(
+                route_plan.exit_condition, round_result.task_results,
+            ):
+                self.console.print(
+                    f"[green]✅ 退出条件满足: {route_plan.exit_condition}[/green]"
+                )
+                break
+
+            # 检查是否全部成功
+            if round_result.is_success:
+                self.console.print("[green]✅ 本轮全部成功，辩论结束[/green]")
+                break
+
+        total_duration = (time_mod.monotonic() - start_time) * 1000
+        aggregate = await self._aggregate(user_input, all_results, route_plan.analysis)
+
+        return SchedulerResult(
+            user_input=user_input,
+            route_plan=route_plan,
+            task_results=all_results,
+            aggregate=aggregate,
+            total_duration_ms=total_duration,
+        )
+
+    # ── 策略实现：reflection（自反思循环）────────────────────────
+
+    async def _execute_reflection(
+        self,
+        user_input: str,
+        route_plan: RoutePlan,
+        agents: dict[str, AgentManifest],
+        show_dashboard: bool,
+    ) -> SchedulerResult:
+        """Reflection 策略：执行 → 自审 → 改进，同一 Agent 内循环。
+
+        典型场景：OmniAgent 写代码 → 自审查 → 改进 → 再审查 → ...
+        """
+        all_results: list[TaskExecutionResult] = []
+        start_time = time_mod.monotonic()
+
+        self.console.print(
+            f"[bold magenta]🪞 自反思模式: 最多 {route_plan.max_iterations} 轮[/bold magenta]"
+        )
+
+        previous_output = ""
+        for iteration in range(1, route_plan.max_iterations + 1):
+            self.console.print(
+                f"\n[bold]── Reflection Round {iteration}/{route_plan.max_iterations} ──[/bold]"
+            )
+
+            # 注入上一轮的输出作为反思上下文
+            if previous_output:
+                for task in route_plan.tasks:
+                    task.params["context"] = (
+                        f"这是第 {iteration} 轮改进。\n"
+                        f"上一轮输出:\n{previous_output[:500]}\n\n"
+                        f"请审查以上输出，找出可改进之处，然后给出改进版本。"
+                    )
+                    task.params["iteration"] = iteration
+
+            if show_dashboard:
+                round_result = await self._execute_with_dashboard(
+                    f"{user_input} (reflection round {iteration})", route_plan, agents,
+                )
+            else:
+                round_result = await self._execute_headless(
+                    f"{user_input} (reflection round {iteration})", route_plan, agents,
+                )
+
+            all_results.extend(round_result.task_results)
+
+            # 保存输出用于下一轮反思
+            if round_result.task_results:
+                previous_output = round_result.task_results[-1].output
+
+            # 检查退出条件
+            if route_plan.exit_condition and self._check_exit_condition(
+                route_plan.exit_condition, round_result.task_results,
+            ):
+                self.console.print(
+                    f"[green]✅ 退出条件满足: {route_plan.exit_condition}[/green]"
+                )
+                break
+
+        total_duration = (time_mod.monotonic() - start_time) * 1000
+        aggregate = await self._aggregate(user_input, all_results, route_plan.analysis)
+
+        return SchedulerResult(
+            user_input=user_input,
+            route_plan=route_plan,
+            task_results=all_results,
+            aggregate=aggregate,
+            total_duration_ms=total_duration,
+        )
+
+    # ── 策略实现：vote（多视角投票）─────────────────────────────
+
+    async def _execute_vote(
+        self,
+        user_input: str,
+        route_plan: RoutePlan,
+        agents: dict[str, AgentManifest],
+        show_dashboard: bool,
+    ) -> SchedulerResult:
+        """Vote 策略：同一任务 → 多模型执行 → LLM 比较差异 → 选最佳。
+
+        将每个 task 用 model_priority 中的前 N 个模型各执行一次，
+        然后用 LLM 比较各模型的输出，整合为最优结果。
+        """
+        self.console.print("[bold magenta]🗳 投票模式: 多模型并发执行[/bold magenta]")
+
+        all_results: list[TaskExecutionResult] = []
+        start_time = time_mod.monotonic()
+
+        # 每个 task 用多个模型各执行一次
+        models = self.model_priority[:3]  # 最多 3 个模型
+        if len(models) < 2:
+            self.console.print("[dim]  仅 1 个模型可用，回退到 fan_out[/dim]")
+            return await self._execute_fan_out(user_input, route_plan, agents, show_dashboard)
+
+        self.console.print(f"[dim]  使用模型: {', '.join(models)}[/dim]")
+
+        for task in route_plan.tasks:
+            self.console.print(f"\n[bold]  📍 任务: [{task.agent}] {task.task}[/bold]")
+            task_outputs: list[dict] = []
+
+            for model_id in models:
+                self.console.print(f"[dim]    🤖 {model_id}...[/dim]")
+                # 临时切换模型优先级为单模型
+                orig_priority = self.model_priority
+                self.model_priority = [model_id]
+
+                try:
+                    result = await self._execute_single_task(task, agents, dash=None)
+                finally:
+                    self.model_priority = orig_priority
+
+                task_outputs.append({
+                    "model": model_id,
+                    "success": result.success,
+                    "output": result.output[:600],
+                    "error": result.error[:200],
+                    "duration_ms": result.duration_ms,
+                })
+                all_results.append(result)
+
+            # LLM 比较各模型输出
+            if len(task_outputs) >= 2:
+                comparison_prompt = (
+                    f"原始任务: {task.description or task.task}\n\n"
+                    + "\n\n---\n\n".join(
+                        f"模型 [{t['model']}]:\n{t['output']}"
+                        for t in task_outputs if t['success']
+                    )
+                    + "\n\n请比较以上各模型的输出，选出最佳回答或整合为最优答案。用中文回复。"
+                )
+                try:
+                    from agent_hub.llm import chat_completion_from_config
+                    best = await chat_completion_from_config(
+                        model_id=models[0],
+                        messages=[{"role": "user", "content": comparison_prompt}],
+                        max_tokens=1024, temperature=0.3,
+                    )
+                    if best:
+                        self.console.print(f"    [green]✅ 最佳答案已生成[/green]")
+                except Exception:
+                    best = None
+
+        total_duration = (time_mod.monotonic() - start_time) * 1000
+        aggregate = await self._aggregate(user_input, all_results, route_plan.analysis)
+
+        return SchedulerResult(
+            user_input=user_input, route_plan=route_plan,
+            task_results=all_results, aggregate=aggregate,
+            total_duration_ms=total_duration,
+        )
+
+    # ── 策略实现：plan_execute（先规划后执行）────────────────────
+
+    async def _execute_plan_execute(
+        self,
+        user_input: str,
+        route_plan: RoutePlan,
+        agents: dict[str, AgentManifest],
+        show_dashboard: bool,
+    ) -> SchedulerResult:
+        """Plan-Execute 策略：先规划 → 按步执行 → 失败则自动重规划。
+
+        将第一个 task 作为"规划阶段"，后续 task 作为"执行阶段"。
+        执行阶段中的任何失败会触发重规划（将失败信息反馈给规划 Agent）。
+        """
+        self.console.print("[bold magenta]📋 规划-执行模式[/bold magenta]")
+
+        all_results: list[TaskExecutionResult] = []
+        start_time = time_mod.monotonic()
+        max_replans = route_plan.max_iterations
+
+        for replan_round in range(max_replans + 1):
+            if replan_round == 0:
+                self.console.print("[bold]  📐 规划阶段...[/bold]")
+            else:
+                self.console.print(f"[bold]  🔄 重规划 (第 {replan_round} 次)...[/bold]")
+
+            # 执行所有 tasks（DAG 顺序）
+            if show_dashboard:
+                round_result = await self._execute_with_dashboard(
+                    user_input, route_plan, agents,
+                )
+            else:
+                round_result = await self._execute_headless(
+                    user_input, route_plan, agents,
+                )
+
+            all_results.extend(round_result.task_results)
+
+            # 检查是否全部成功
+            if round_result.is_success:
+                self.console.print("[green]✅ 所有步骤成功[/green]")
+                break
+
+            # 有失败 → 尝试重规划
+            if replan_round < max_replans:
+                failures = [
+                    f"[{r.task.agent}] {r.task.task}: {r.error}"
+                    for r in round_result.task_results if not r.success
+                ]
+                self.console.print(
+                    f"[yellow]⚠️  {len(failures)} 个步骤失败，触发重规划[/yellow]"
+                )
+                # 将失败信息注入第一个 task 的 params 作为 context
+                if route_plan.tasks:
+                    route_plan.tasks[0].params["context"] = (
+                        f"上一轮执行中 {len(failures)} 个步骤失败:\n"
+                        + "\n".join(failures)
+                        + "\n\n请调整计划以解决以上问题。"
+                    )
+            else:
+                self.console.print("[red]✗ 重规划次数耗尽[/red]")
+
+        total_duration = (time_mod.monotonic() - start_time) * 1000
+        aggregate = await self._aggregate(user_input, all_results, route_plan.analysis)
+
+        return SchedulerResult(
+            user_input=user_input, route_plan=route_plan,
+            task_results=all_results, aggregate=aggregate,
+            total_duration_ms=total_duration,
+        )
+
+    # ── 策略实现：hitl（人机协同）───────────────────────────────
+
+    async def _execute_hitl(
+        self,
+        user_input: str,
+        route_plan: RoutePlan,
+        agents: dict[str, AgentManifest],
+        show_dashboard: bool,
+    ) -> SchedulerResult:
+        """Human-in-the-loop 策略：逐任务执行，审批关卡处暂停等人类确认。
+
+        审批关卡 = route_plan.approval_gates 中列出的 task ID。
+        被标记的 task 完成后暂停，展示输出，等待用户选择：
+          [Y] 批准继续  [n] 拒绝中止  [r] 重试（输入反馈）
+        """
+        from rich.prompt import Prompt as RichPrompt
+
+        self.console.print(
+            f"[bold magenta]👤 人机协同模式[/bold magenta]"
+            + (f" [审批关卡: 步骤 {route_plan.approval_gates}]" if route_plan.approval_gates else "")
+        )
+        self.console.print("[dim]  关键操作将在执行后等待您的确认[/dim]")
+
+        all_results: list[TaskExecutionResult] = []
+        start_time = time_mod.monotonic()
+        approval_set = set(route_plan.approval_gates)
+
+        # HitL 使用串行执行（逐任务），确保审批流清晰
+        for task in route_plan.tasks:
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                self.console.print(
+                    f"\n[bold]  ▶ [{task.agent}] {task.task}[/bold]"
+                    + (f" [审批关卡]" if task.id in approval_set else "")
+                )
+
+                # 执行单个任务
+                result = await self._execute_single_task(task, agents, dash=None)
+                all_results.append(result)
+
+                icon = "✅" if result.success else "❌"
+                self.console.print(
+                    f"  {icon} 完成 ({result.duration_ms:.0f}ms)"
+                )
+                if result.output:
+                    self.console.print(f"  [dim]输出: {result.output[:300]}[/dim]")
+                if result.error:
+                    self.console.print(f"  [red]错误: {result.error[:200]}[/red]")
+
+                # 非审批关卡 → 直接继续
+                if task.id not in approval_set:
+                    break
+
+                # 审批关卡 → 等待人类决策
+                self.console.print()
+                choice = RichPrompt.ask(
+                    f"  [bold yellow]⚠ 审批关卡[/bold yellow] — "
+                    f"[{task.agent}] {task.task}",
+                    choices=["Y", "n", "r"],
+                    default="Y",
+                )
+
+                if choice == "Y":
+                    self.console.print("  [green]✅ 已批准，继续[/green]")
+                    break  # 批准，继续下一个 task
+                elif choice == "n":
+                    self.console.print("  [red]✗ 已拒绝，中止执行[/red]")
+                    # 返回已收集的结果
+                    total_duration = (time_mod.monotonic() - start_time) * 1000
+                    aggregate = f"执行被用户中止于步骤 {task.id} ([{task.agent}] {task.task})"
+                    return SchedulerResult(
+                        user_input=user_input, route_plan=route_plan,
+                        task_results=all_results, aggregate=aggregate,
+                        total_duration_ms=total_duration,
+                    )
+                elif choice == "r":
+                    if attempt < max_retries:
+                        feedback = RichPrompt.ask("    反馈（将传给 Agent 重试）", default="请改进输出质量")
+                        task.params["context"] = f"用户反馈: {feedback}\n请根据反馈重新执行。"
+                        task.params["retry_attempt"] = attempt
+                        self.console.print(f"  [yellow]🔄 重试 (第 {attempt}/{max_retries} 次)[/yellow]")
+                    else:
+                        self.console.print(f"  [red]✗ 已达最大重试次数 ({max_retries})[/red]")
+                        break
+
+        total_duration = (time_mod.monotonic() - start_time) * 1000
+        aggregate = await self._aggregate(user_input, all_results, route_plan.analysis)
+
+        return SchedulerResult(
+            user_input=user_input, route_plan=route_plan,
+            task_results=all_results, aggregate=aggregate,
+            total_duration_ms=total_duration,
+        )
+
+    # ── 退出条件求值 ──────────────────────────────────────────
+
+    @staticmethod
+    def _check_exit_condition(
+        condition: str,
+        task_results: list[TaskExecutionResult],
+    ) -> bool:
+        """简易退出条件求值器。
+
+        支持的格式（安全子集，不使用 eval）：
+        - "success" → 所有任务成功
+        - "score >= 90" / "pass_rate > 0.9" → 从输出中提取数值比较
+
+        Returns:
+            True 如果条件满足
+        """
+        if not condition or not condition.strip():
+            return False
+
+        condition = condition.strip().lower()
+
+        # "success" → 全部成功
+        if condition == "success":
+            return all(r.success for r in task_results)
+
+        # 尝试解析 "key op value" 格式
+        import re
+        match = re.match(r"(\w+)\s*(>=|<=|>|<|==|!=)\s*([\d.]+)", condition)
+        if not match:
+            return False
+
+        key, op, target_str = match.group(1), match.group(2), match.group(3)
+        try:
+            target = float(target_str)
+        except ValueError:
+            return False
+
+        # 在每个 task_result 的 output 中搜索 key: value 或 key=value 或 key value
+        for r in task_results:
+            if not r.success:
+                continue
+            output = r.output.lower()
+            # 尝试多种格式: "score: 92", "score=92", "score 92"
+            for pattern in [
+                rf"{key}\s*[:=]\s*([\d.]+)",
+                rf"{key}\s+([\d.]+)",
+            ]:
+                m = re.search(pattern, output)
+                if m:
+                    try:
+                        value = float(m.group(1))
+                    except ValueError:
+                        continue
+                    if op == ">=":
+                        return value >= target
+                    elif op == "<=":
+                        return value <= target
+                    elif op == ">":
+                        return value > target
+                    elif op == "<":
+                        return value < target
+                    elif op == "==":
+                        return value == target
+                    elif op == "!=":
+                        return value != target
+
+        return False
 
     def _load_agents(self) -> dict[str, AgentManifest]:
         """从 agents.d/ 加载 Agent 清单。"""
@@ -749,6 +1341,76 @@ class AgentScheduler:
 
         else:
             return f"Unknown action: {action}. Available: start, stop, restart, status"
+
+    # ── Cron 集成 ──────────────────────────────────────────────
+
+    def _start_cron_if_needed(self) -> None:
+        """如 .agent_hub/cron_jobs.json 存在且有任务，则启动 cron 循环。"""
+        if self._cron is not None:
+            return  # 已启动
+
+        self._cron = CronScheduler()
+        if not self._cron.list_jobs():
+            return  # 无定时任务，不启动循环
+
+        asyncio.create_task(
+            self._cron.start_loop(self._execute_cron_job),
+            name="cron-scheduler-bg",
+        )
+        logger.info("Cron 调度器已自动启动 (%d 个任务)", len(self._cron.list_jobs()))
+
+    async def _execute_cron_job(self, job: CronJob) -> CronRunRecord:
+        """执行单个定时任务（cron 回调）。"""
+        import time as _time
+        start = _time.monotonic()
+
+        # 构造 RoutedTask
+        task = RoutedTask(
+            id=0,
+            agent=job.agent,
+            task=job.task,
+            description=f"定时任务: {job.name}",
+            params=job.params,
+            depends_on=[],
+        )
+
+        try:
+            # 加载 agents 并执行
+            agents = self._load_agents()
+            if job.agent not in agents:
+                return CronRunRecord(
+                    job_name=job.name,
+                    agent=job.agent,
+                    task=job.task,
+                    success=False,
+                    error=f"Agent '{job.agent}' 未注册",
+                    duration_ms=(_time.monotonic() - start) * 1000,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
+
+            result = await self._execute_single_task(task, agents, dash=None)
+
+            return CronRunRecord(
+                job_name=job.name,
+                agent=job.agent,
+                task=job.task,
+                success=result.success,
+                output=result.output[:500],
+                error=result.error[:500],
+                duration_ms=result.duration_ms,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+
+        except Exception as e:
+            return CronRunRecord(
+                job_name=job.name,
+                agent=job.agent,
+                task=job.task,
+                success=False,
+                error=str(e),
+                duration_ms=(_time.monotonic() - start) * 1000,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
 
     # ── 便捷方法 ─────────────────────────────────────────────────
 
