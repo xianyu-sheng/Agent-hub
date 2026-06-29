@@ -157,7 +157,10 @@ class AgentManifest:
         display_name: 人类可读的名称（如 "通用 AI 编程 Agent"）
         description: 详细功能描述，供 LLM 路由使用
         capabilities: 能力集合（任务、工具、模型）
-        protocol: 通信协议（"cli" | "mcp" | "http"），默认 "cli"
+        protocol: 通信协议，默认 "cli"。
+            "cli" — 已实现，通过 CLI Bridge 子进程执行（当前稳定）。
+            "mcp" — 计划中，未来将通过 MCPBridge 支持 Model Context Protocol。
+            "http" — 计划中，未来将通过 HTTPBridge 支持 REST API 调用。
         interface: CLI 接口描述
         version: manifest 格式版本
         source_path: agent.yaml 文件所在目录的绝对路径（运行时填充）
