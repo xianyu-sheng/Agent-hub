@@ -1,6 +1,6 @@
 # Agent Hub 注册文件 — agent-hub (自身)
 # Agent-hub 也是一个 Agent，具备意图路由、Agent 管理、结果汇总等能力
-project_path: D:/Agent-hub
+project_path: /home/xianyu-sheng/Agent-hub
 
 # Agent: Agent Hub Scheduler
 # 协议: internal（进程内调度，避免递归）

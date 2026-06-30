@@ -1618,3 +1618,6 @@ capabilities:
 interface:
   command: cd {safe_path} && python -m {project_name} --json-output "{{goal}}"
 """
+
+if __name__ == "__main__":
+    main()

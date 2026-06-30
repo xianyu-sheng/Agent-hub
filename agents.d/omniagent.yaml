@@ -2,7 +2,7 @@
 # 由 agent-hub agent register D:/OmniAgent_CLI 生成
 # 可手动编辑 project_path 指向你的项目位置
 
-project_path: D:/OmniAgent_CLI
+project_path: /home/xianyu-sheng/OmniAgent_CLI
 
 # Agent: 通用 AI 编程 Agent
 # 协议: cli

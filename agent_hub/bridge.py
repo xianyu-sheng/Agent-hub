@@ -640,6 +640,15 @@ class CLIBridge:
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUTF8", "1")
 
+        # 过滤代理环境变量，避免未运行的本地代理导致子进程网络请求失败
+        _proxy_vars = [
+            "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+            "all_proxy", "ALL_PROXY", "ftp_proxy", "FTP_PROXY",
+            "no_proxy", "NO_PROXY",
+        ]
+        for _pv in _proxy_vars:
+            env.pop(_pv, None)
+
         return env
 
     # ── 输出解析 ─────────────────────────────────────────────────

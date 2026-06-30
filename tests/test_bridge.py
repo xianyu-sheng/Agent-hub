@@ -6,8 +6,11 @@ No real subprocess calls are made.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
+
+import pytest
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -725,6 +728,7 @@ class TestEnsureProjectDir:
         result = CLIBridge._ensure_project_dir("/path/to/dir")
         assert result == "/path/to/dir"
 
+    @pytest.mark.skipif(os.name != "nt", reason="Backslash normalization only applies on Windows")
     def test_backslash_normalization(self):
         with patch("os.path.isdir") as mock_isdir:
             mock_isdir.return_value = True
