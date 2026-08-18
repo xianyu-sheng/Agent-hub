@@ -1,6 +1,6 @@
 # Agent Hub
 
-> **Multi-Agent Orchestration System** — LLM intent routing, DAG scheduling, and 7 collaboration strategies.
+> **Multi-Agent orchestration system** — LLM intent routing, Kahn-wave DAG scheduling, and 7 collaboration strategies over zero-intrusion `agent.yaml` manifests.
 
 <p align="center">
   <a href="README_CN.md">📖 中文文档 → README_CN.md</a>
@@ -10,8 +10,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square&logo=python" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License MIT">
   <img src="https://img.shields.io/badge/status-beta-yellow?style=flat-square" alt="Status Beta">
-  <img src="https://img.shields.io/badge/tests-30%20passed-brightgreen?style=flat-square" alt="Tests 30 Passed">
-  <img src="https://img.shields.io/badge/coverage-80%25-yellowgreen?style=flat-square" alt="Coverage 80%">
+  <img src="https://img.shields.io/badge/tests-465%20collected-brightgreen?style=flat-square" alt="Tests">
 </p>
 
 ---
@@ -22,16 +21,11 @@
 - [Architecture](#architecture)
 - [Design Principles](#design-principles)
 - [Features](#features)
-  - [Smart Routing](#smart-routing)
-  - [Session Memory](#session-memory)
-  - [Watchdog](#watchdog)
-  - [Cron Scheduler](#cron-scheduler)
 - [Collaboration Strategies](#collaboration-strategies)
 - [Quick Start](#quick-start)
-- [REPL Usage](#repl-usage)
 - [Command Reference](#command-reference)
 - [Agent Manifest Protocol](#agent-manifest-protocol)
-- [Readiness Check](#readiness-check)
+- [Model Configuration](#model-configuration)
 - [Testing](#testing)
 - [Project Map](#project-map)
 - [FAQ](#faq)
@@ -41,30 +35,33 @@
 
 ## Overview
 
-Agent Hub is a **decoupled central scheduler** for multi-agent orchestration. It discovers professional agents through lightweight `agent.yaml` manifest files, routes natural language requests into cross-agent DAGs, and executes them using 7 different collaboration strategies.
+Agent Hub is a **decoupled central scheduler** for multi-agent orchestration. It discovers professional agents through `agent.yaml` manifest files, routes natural-language requests into cross-agent DAGs with an LLM router, and executes them using 7 collaboration strategies — with a Rich TUI dashboard showing the task graph, per-agent panels, and data-flow timeline in real time.
 
-The system follows a **zero-intrusion** philosophy — each existing project only needs to add a single `agent.yaml` file to become discoverable and callable by Agent Hub. No restructuring, no deep coupling.
+The system follows a **zero-intrusion** philosophy: each existing project adds a single `agent.yaml` at its root to become discoverable and callable. No restructuring, no framework imports, no deep coupling.
+
+**Core idea**: not building yet another agent, but building the system that lets specialized agents work together — Agent Hub is the glue, professional agents are the building blocks.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                   Agent Hub (Orchestrator)               │
+│                  Agent Hub (Orchestrator)                │
 │  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │
-│  │ Smart Router │─▶│ DAG Scheduler│─▶│ Strategy Exec. │  │
-│  └─────────────┘  └──────────────┘  └────────────────┘  │
-│         │                │                    │          │
-│    ┌────┴────┐     ┌────┴────┐         ┌─────┴─────┐   │
-│    │ Session │     │ Cron    │         │ Watchdog  │    │
-│    │ Memory  │     │ Sched.  │         │ Monitor   │    │
-│    └─────────┘     └─────────┘         └───────────┘   │
+│  │ LLM Router  │─▶│ DAG Scheduler│─▶│ Strategy Exec. │  │
+│  │ (intent →   │  │ (Kahn waves) │  │ (7 strategies) │  │
+│  │  route plan)│  └──────────────┘  └────────────────┘  │
+│  └─────────────┘         │                    │          │
+│    ┌────────────┐  ┌─────┴─────┐       ┌──────┴──────┐   │
+│    │ Session    │  │ Cron      │       │ Watchdog    │   │
+│    │ Store      │  │ Scheduler │       │ (auto-heal) │   │
+│    └────────────┘  └───────────┘       └─────────────┘   │
 └───────────────────────┬─────────────────────────────────┘
                         │  agent.yaml (read-only)
         ┌───────────────┼───────────────┐
         ▼               ▼               ▼
 ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│  OmniAgent   │ │ Resume-Sync  │ │ SmartBench    │
-│  (CLI/MCP)   │ │  (CLI)       │ │  (CLI/MCP)   │
-│  Coding      │ │  Resume      │ │ Code Analysis │
-│  Assistant   │ │  Automation  │ │ & Debate     │
+│  OmniAgent   │ │ Resume-Sync  │ │  SmartBench  │
+│  (CLI)       │ │  (CLI)       │ │  (CLI)       │
+│  Coding      │ │  Resume      │ │  Code        │
+│  Assistant   │ │  Automation  │ │  Diagnosis   │
 └──────────────┘ └──────────────┘ └──────────────┘
 ```
 
@@ -78,23 +75,23 @@ The system follows a **zero-intrusion** philosophy — each existing project onl
 ┌──────────────────────────────────────────────────────────┐
 │                AGENT HUB (Orchestrator)                   │
 │  Central scheduler — intent routing, DAG building,       │
-│  strategy execution, session memory, watchdog, cron       │
+│  strategy execution, session store, watchdog, cron        │
 ├──────────────────────────────────────────────────────────┤
 │                AGENT MANIFEST (agent.yaml)                │
 │  Read-only descriptor — each project adds ONE file        │
 │  name, description, capabilities, interface templates     │
 ├──────────────────────────────────────────────────────────┤
 │             PROFESSIONAL AGENTS (Executors)               │
-│  omniagent │ resume-sync │ SmartBench │ ...              │
-│  (cli / internal / mcp / http protocols)                  │
+│  OmniAgent │ resume-sync │ SmartBench │ ...              │
+│  (cli / internal protocols; mcp / http planned)           │
 └──────────────────────────────────────────────────────────┘
 ```
 
 | Layer | Description |
 |---|---|
-| **Agent Hub** | Central orchestrator — handles intent recognition, routing, DAG scheduling, strategy execution, session memory, watchdog, and cron scheduling. No domain-specific logic. |
-| **Agent Manifest** | A single `agent.yaml` file per project, acting as a read-only descriptor. Contains the agent's name, description, capabilities, tasks, and interface call templates. |
-| **Professional Agents** | The actual domain-specific agents (e.g., omniagent for coding, resume-sync for resume automation, SmartBench for code analysis). Communicate via CLI, internal Python calls, MCP, or HTTP. |
+| **Agent Hub** | Central orchestrator — intent recognition, routing, DAG scheduling, strategy execution, session store, watchdog, cron scheduling. No domain-specific logic. |
+| **Agent Manifest** | A single `agent.yaml` file per project, acting as a read-only descriptor: name, description, capabilities, tasks, and interface call templates. |
+| **Professional Agents** | Domain-specific agents (OmniAgent for coding, resume-sync for resume automation, SmartBench for code diagnosis). Today they communicate via **CLI subprocess** (`cli`) or **in-process dispatch** (`internal`). `mcp` and `http` protocols are declared in the manifest schema but not yet implemented — see the validator warning in `agent_hub/manifest.py`. |
 
 ---
 
@@ -102,62 +99,63 @@ The system follows a **zero-intrusion** philosophy — each existing project onl
 
 | Principle | Description |
 |---|---|
-| **Zero-Intrusion** | Each existing project only needs to add one `agent.yaml` file. No code changes, no framework imports, no deep coupling. |
-| **Interactive Guidance** | When a user's intent is ambiguous, the system proactively asks clarifying questions rather than guessing or failing silently. |
-| **Natural-Language-First** | Users express their goals in natural language. The system understands, disambiguates, and translates into executable DAGs. |
-| **On-Demand Invocation** | Agents are only loaded and called when needed. No persistent connections or background polling. |
-| **Intelligent Fallback** | When routing confidence is low or an agent fails, the system degrades gracefully — fuzzy matching, rule-based fallbacks, and clear user-facing warnings. |
+| **Zero-Intrusion** | Each project only adds one `agent.yaml`. No code changes, no framework imports, no deep coupling. |
+| **Natural-Language-First** | Users state goals in natural language. The LLM router decomposes them into an executable task DAG. |
+| **On-Demand Invocation** | Agents are started only when needed. No persistent connections or background polling. |
+| **Graceful Degradation** | When routing confidence is low (< 0.7) the CLI shows a warning; when the LLM call fails entirely, the router falls back to deterministic rule-based matching (`_rule_based_route` in `agent_hub/router.py`). |
 
 ---
 
 ## Features
 
-### Smart Routing
+### Smart Routing (`agent_hub/router.py`)
 
 | Capability | Description |
 |---|---|
-| **Input Optimization** | Automatically rewrites and enriches user queries for better intent recognition. |
-| **Collaboration Strategy Inference** | Analyzes the task to determine which of the 7 collaboration strategies is most appropriate. |
-| **Routing Memory** | Caches routing decisions for repeated requests — skips LLM inference on identical inputs. |
-| **Confidence Gating** | If routing confidence is below 70%, the system shows a user warning and asks for confirmation. |
-| **Fuzzy Matching** | When exact intent matching fails, performs fuzzy matching against known agent capabilities. |
-| **Rule Fallback** | If LLM-based routing is unavailable, falls back to deterministic rule-based matching. |
+| **Input Optimization** | Rewrites and enriches user queries before intent recognition (`_optimize_input`). |
+| **Strategy Inference** | The LLM route plan selects one of the 7 collaboration strategies per task. |
+| **Routing Memory** | Caches routing decisions; identical or repeated inputs skip LLM inference (`_check_routing_memory`). |
+| **Confidence Gating** | Plans with `confidence < 0.7` are flagged (`CONFIDENCE_WARN_THRESHOLD`) and surfaced to the user. |
+| **Fuzzy Matching** | Falls back to fuzzy task-to-capability matching when exact intent matching fails (`_fuzzy_match_task`). |
+| **Rule Fallback** | If the LLM call fails, deterministic rule-based routing takes over (`fallback_rule_based=True` by default). |
 
-### Session Memory
+### Session Store (`agent_hub/session_store.py`)
 
 | Feature | Detail |
 |---|---|
-| Cross-turn context | Maintains conversation state across multiple exchanges. |
-| Last 3 rounds injected | Recent conversation history is injected into the routing prompt for context-aware decisions. |
-| Auto-cleanup | Automatically trims the conversation history to keep the last 50 rounds to manage context window. |
+| Cross-turn context | Conversation state persisted across exchanges. |
+| History injection | Recent conversation rounds are injected into the routing prompt for context-aware decisions. |
+| Auto-cleanup | Keeps the most recent 50 session files (`MAX_SESSION_FILES = 50`). |
 
-### Watchdog
+### Watchdog (`agent_hub/bridge.py`)
 
-- Monitors all running agent processes.
-- Auto-restarts crashed processes (max 3 restarts within 5 minutes).
-- If the restart limit is exceeded, marks the agent as **failed** and notifies the orchestrator.
+- Monitors all running agent processes on a 15-second loop (`start_watchdog(interval=15)`).
+- Auto-restarts crashed agents: at most **3 restarts within a 300-second window** (`MAX_RESTARTS = 3`, `RESTART_WINDOW = 300.0`).
+- Beyond the limit, the agent is marked **failed** and the orchestrator is notified.
 
-### Cron Scheduler
+### Cron Scheduler (`agent_hub/cron.py`)
 
-- Pure Python cron engine — **zero external dependencies**.
-- Standard 5-field cron syntax (`minute hour day month weekday`).
-- Execution history is persisted to disk for audit and recovery.
+- Pure-Python 5-field cron engine — **zero external dependencies** (no croniter).
+- Supports exact values, `*`, steps (`*/5`), lists (`0,30`), and ranges (`1-5`).
+- Job definitions persist to `.agent_hub/cron_jobs.json`; execution history (last 100 entries, `MAX_HISTORY_ENTRIES = 100`) to `.agent_hub/cron_history.json`.
 
 ---
 
 ## Collaboration Strategies
 
-Agent Hub supports 7 collaboration strategies for orchestrating multi-agent workflows:
+Agent Hub supports 7 collaboration strategies (`agent_hub/router.py` `StrategyType`, executed in `agent_hub/scheduler.py`):
 
 | # | Strategy | Pattern | Use Case |
 |---|----------|---------|----------|
-| 1 | **fan_out** | Parallel dispatch to multiple agents, then aggregate results | Code review by multiple analyzers simultaneously |
-| 2 | **debate** | diagnose → fix → loop (iterative critique between agents) | Bug diagnosis with cross-agent verification |
-| 3 | **reflection** | execute → self-review → improve | Code generation with self-correction |
-| 4 | **vote** | Multi-model concurrent execution → compare results | Selecting the best output from multiple LLMs |
-| 5 | **plan_execute** | Plan first → execute step by step | Complex multi-step tasks requiring decomposition |
-| 6 | **hitl** | Human-in-the-loop — pause for approval at critical steps | Sensitive operations (deployments, data deletion) |
-| 7 | **pipeline** | Sequential execution through a chain of agents | ETL pipelines, multi-stage processing |
+| 1 | **fan_out** | Parallel dispatch to multiple agents, then aggregate results (default DAG mode) | Independent tasks executed concurrently |
+| 2 | **pipeline** | Strict serial chain — emerges naturally from `depends_on` edges in the DAG | ETL-style multi-stage processing |
+| 3 | **debate** | Agent A proposes → Agent B critiques → A revises → loop until exit condition | Bug diagnosis with cross-agent verification |
+| 4 | **reflection** | Single agent: execute → self-review → improve, up to `max_iterations` | Code generation with self-correction |
+| 5 | **vote** | Same question to multiple agents/models → pick the best output | Selecting the strongest answer |
+| 6 | **plan_execute** | Plan first → execute step by step → re-plan on failure | Complex multi-step tasks |
+| 7 | **hitl** | Human-in-the-loop — pause for approval at `approval_gates` task IDs | Sensitive operations needing sign-off |
+
+Unknown strategy names fall back to `fan_out` with a warning. Loop strategies (`debate` / `reflection`) are bounded by `max_iterations`; `hitl` declares its approval gates in the route plan.
 
 ### Strategy Decision Flow
 
@@ -166,30 +164,23 @@ User Request
      │
      ▼
 ┌─────────────────┐
-│ Intent Analysis │
+│ LLM Router      │  (input optimization → route plan + confidence)
 └────────┬────────┘
          │
-    ┌────┴────┐
-    │  Single │      Multi
-    │  Agent? │───────┼──────────
-    └────┬────┘       │
-         │            ▼
-    ┌────┴────┐  ┌──────────┐
-    │ Execute │  │ Strategy │
-    │ Directly│  │ Selection│
-    └─────────┘  └────┬─────┘
-                      │
-         ┌────────────┼────────────┬───────────┬──────────┐
-         ▼            ▼            ▼           ▼          ▼
-     ┌──────┐   ┌────────┐  ┌──────────┐ ┌──────┐  ┌────────┐
-     │Fanout│   │ Debate │  │Reflection│ │ Vote │  │Pipeline│
-     └──────┘   └────────┘  └──────────┘ └──────┘  └────────┘
-                                           ┌──────┐
-                                           │HITL  │
-                                           └──────┘
-                                      ┌─────────────┐
-                                      │Plan_Execute │
-                                      └─────────────┘
+    ┌────┴────────┐
+    │ Route plan  │── tasks[], strategy, max_iterations, approval_gates
+    └────┬────────┘
+         │
+         ▼
+┌─────────────────┐     ┌──────────────────────────────────────┐
+│ DAG Builder     │────▶│ Kahn topological waves (parallel)    │
+└────────┬────────┘     └──────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Strategy Executor: fan_out / pipeline / debate / reflection │
+│                    / vote / plan_execute / hitl             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -199,254 +190,214 @@ User Request
 ### Prerequisites
 
 - Python 3.10 or higher
-- (Optional) API keys for LLM providers you plan to use
+- An API key for at least one LLM provider (DeepSeek by default; any OpenAI-compatible endpoint works)
 
 ### Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/xianyu-sheng/Agent-hub.git
 cd Agent-hub
 
-# (Recommended) Create a virtual environment
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
+source venv/bin/activate  # Linux/macOS
 # venv\Scripts\activate   # Windows
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Install in development mode
 pip install -e .
 ```
 
+Runtime dependencies are minimal: `pyyaml`, `rich`, `click` (declared in `pyproject.toml`; there is no separate `requirements.txt`).
+
 ### Configuration
 
-Create a `.env` file in the project root:
+Register at least one model — the fastest path is the interactive command center:
 
 ```bash
-# At least one LLM provider is required
-OPENAI_API_KEY=sk-...
-# or
-DEEPSEEK_API_KEY=sk-...
-# or
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Optional: Agent search paths (comma-separated)
-AGENT_PATH=./agents,~/my-agents
+agent-hub            # bare launch enters the interactive command center (REPL)
 ```
+
+```
+agent-hub> models add        # interactive: name + API key, provider auto-detected
+```
+
+Or via environment variable:
+
+```bash
+export DEEPSEEK_API_KEY=sk-...
+```
+
+Model definitions live in `models.yaml` (`${VAR}` syntax references environment variables — keys never sit in plaintext).
 
 ### Basic Usage
 
 ```bash
-# Launch the REPL
-agent-hub repl
+# Interactive command center (bare `agent-hub` with no subcommand)
+agent-hub
 
-# One-shot task execution
-agent-hub run "Review the code in ./src for security issues"
+# One-shot task execution (streaming output by default)
+agent-hub run "Analyze OmniAgent code quality and update my resume"
 
-# List discovered agents
-agent-hub list
+# With the multi-panel TUI dashboard
+agent-hub run -d "Review the code in ./src for security issues"
 
-# Show agent details
-agent-hub info omniagent
+# Agent lifecycle
+agent-hub start                # start all registered agents + health panel
+agent-hub status               # system overview
+agent-hub stop                 # stop all agents
+
+# Agent management
+agent-hub agent list
+agent-hub agent info omniagent
+agent-hub agent register /path/to/project    # reads its agent.yaml
+agent-hub agent validate
+
+# Cron scheduling
+agent-hub schedule list
+agent-hub schedule add --name nightly --cron "0 2 * * *" --agent smartbench --task diagnose_code
+agent-hub schedule history
 ```
 
-### Example: Multi-Agent Workflow
+Inside the interactive command center you can also type natural language directly — no `run` prefix needed:
 
 ```
-User: "Fix the bug in main.py and update my resume to mention it"
-
-Agent Hub:
-  1. [Router] Parses intent → two tasks: code fix + resume update
-  2. [DAG Builder] Creates parallel DAG:
-     ┌─────────────┐
-     │─ OmniAgent  │── Code fix for main.py
-     │─ Resume-Sync│── Update resume
-     └─────────────┘
-  3. [Strategy] Assigns "reflection" to OmniAgent, "pipeline" to Resume-Sync
-  4. [Executor] Runs both in parallel, streams results to user
+agent-hub> 分析 agent-hub 代码质量
 ```
-
----
-
-## REPL Usage
-
-Agent Hub includes a rich REPL interface built with [Rich](https://github.com/Textualize/rich).
-
-```
-$ agent-hub repl
-╔════════════════════════════════════════════════════════╗
-║                   Agent Hub REPL                       ║
-║         Multi-Agent Orchestration System               ║
-╚════════════════════════════════════════════════════════╝
-
-Detected agents:
-  [1] omniagent   - AI Coding Assistant (CLI / MCP)
-  [2] resume-sync - Resume Auto-Sync (CLI)
-  [3] SmartBench  - Code Diagnostic Platform (CLI / MCP)
-
-agent-hub> Review security of current project
-╭─ Router ───────────────────────────────────────────────╮
-│ Intent: code_review                                    │
-│ Agent: SmartBench                                      │
-│ Strategy: debate                                       │
-│ Confidence: 87%                                        │
-╰────────────────────────────────────────────────────────╯
-╭─ Execution ────────────────────────────────────────────╮
-│ [SmartBench] Diagnosing... ━━━━━━━━━━━━ 100% 0:00:05   │
-│ [SmartBench] Found 3 potential issues                  │
-│ [SmartBench] Generating fix recommendations...         │
-╰────────────────────────────────────────────────────────╯
-```
-
-### REPL Commands
-
-| Command | Description |
-|---|---|
-| `help` | Show available commands |
-| `agents` / `list` | List all discovered agents |
-| `info <name>` | Show agent details |
-| `status` | Show system status and running tasks |
-| `history` | Show conversation history |
-| `clear` | Clear conversation history |
-| `exit` / `quit` | Exit the REPL |
 
 ---
 
 ## Command Reference
 
-### CLI Commands
+### Top-Level Commands
 
 | Command | Description |
 |---|---|
-| `agent-hub repl` | Launch the interactive TUI REPL |
-| `agent-hub run <task>` | One-shot task execution |
-| `agent-hub list` | List discovered agents |
-| `agent-hub info <name>` | Show agent details |
-| `agent-hub status` | Show system status |
-| `agent-hub cron list` | Show scheduled cron jobs |
-| `agent-hub cron add <schedule>` | Add a cron job |
-| `agent-hub cron remove <id>` | Remove a cron job |
+| `agent-hub` | Launch the interactive command center (REPL) |
+| `agent-hub start [--agents a,b]` | Start registered agents and enter the health-monitoring panel |
+| `agent-hub stop` | Stop all running agents |
+| `agent-hub status` | Show system status and running tasks |
+| `agent-hub run [-d] [-t SECONDS] <task>` | Execute a multi-agent task (`-d` dashboard, `-t` per-agent timeout, default 300s) |
 
-### CLI Options
+### `agent-hub agent …`
 
-| Option | Description |
+| Command | Description |
 |---|---|
-| `--config <path>` | Path to config file |
-| `--agent-path <path>` | Additional path to search for agent.yaml files |
-| `--llm <provider>` | LLM provider to use (openai, deepseek, etc.) |
-| `--model <name>` | Model name override |
-| `--verbose` / `-v` | Verbose output |
-| `--quiet` / `-q` | Quiet mode (minimal output) |
+| `agent list` | List all registered agents |
+| `agent info [name]` | Show agent details |
+| `agent register [path]` | Interactively register a project (reads its `agent.yaml` into `agents.d/`) |
+| `agent reload` | Reload manifests from `agents.d/` after edits |
+| `agent models [name]` | Show models declared by an agent |
+| `agent validate` | Validate all registered manifests |
+
+### `agent-hub models …`
+
+| Command | Description |
+|---|---|
+| `models list` | List configured LLM models |
+| `models info [name]` | Model details |
+| `models add [name] [-k KEY]` | Add a model (interactive or quick mode; provider auto-detected) |
+| `models remove` | Interactively remove a model |
+| `models update` | Interactively update a model |
+| `models priority [order]` | View or set model fallback priority |
+
+### `agent-hub schedule …`
+
+| Command | Description |
+|---|---|
+| `schedule list` | List cron jobs |
+| `schedule add` | Add a cron job (5-field syntax) |
+| `schedule remove [name]` | Remove a job |
+| `schedule run [name]` | Trigger a job immediately |
+| `schedule history [--limit N]` | Show execution history |
+| `schedule stop` | Stop the cron loop |
 
 ---
 
 ## Agent Manifest Protocol
 
-The Agent Manifest protocol is the contract between Agent Hub and any professional agent. Each agent project adds a single `agent.yaml` file at its root.
+The manifest is the contract between Agent Hub and any professional agent. Each agent project adds a single `agent.yaml` at its root, then `agent-hub agent register /path/to/project` copies it into `agents.d/<name>.yaml` with a `project_path` pointer.
 
-### Schema
+### Schema (excerpt)
 
 ```yaml
-name: omniagent                            # Unique agent identifier
-display_name: "OmniAgent"                  # Human-readable name
-description: "AI-powered coding assistant  # What this agent does
-  with multi-model support, MCP tools,
-  and ReAct workflows."
+name: smartbench
+display_name: "SmartBench"
+description: |
+  Evidence-constrained code diagnosis engine.
 
-protocol: cli                              # Communication protocol
-                                           # Options: cli | internal | mcp | http
+protocol: cli            # cli (stable) | internal (in-process) | mcp / http (planned)
 
 capabilities:
-  - task: code_generation                   # Task identifier
-    description: "Generate code from        # Task description
-      natural language descriptions"
-    interface:                              # How to invoke this task
-      command: "omniagent run"
-      args: "{query}"
-      # Template variables:
-      #   {query}      - Original user input
-      #   {session_id} - Current session ID
-      #   {context}    - Conversation context
-    examples:                               # Example queries for this task
-      - "Create a Python REST API with FastAPI"
-      - "Write a binary search in Rust"
-
-  - task: code_review
-    description: "Review code for bugs,
-      security issues, and best practices"
-    interface:
-      command: "omniagent review"
-      args: "{query}"
-    examples:
-      - "Review auth.py for security issues"
-      - "Check my merge request for bugs"
+  tasks:
+    - name: diagnose_code
+      description: "Diagnose code quality and resource-lifecycle risks"
+      # interface templates substitute variables like {query} per invocation
 ```
+
+`internal` agents are dispatched in-process (no subprocess — used by Agent Hub itself to avoid recursion). Registry files under `agents.d/` add a `project_path` pointer to the project's on-disk location.
 
 ### Protocol Types
 
-| Protocol | Description |
-|---|---|
-| `cli` | Invoke via command line subprocess. Requires `command` and `args` in the interface definition. |
-| `internal` | Direct Python import and function call. Agent Hub loads the agent as a Python module. |
-| `mcp` | Model Context Protocol — communicate via stdio or SSE transport. |
-| `http` | Invoke via HTTP request to a running service. Requires `url` in the interface definition. |
+| Protocol | Status | Description |
+|---|---|---|
+| `cli` | Implemented | Invoke via CLI subprocess through `CLIBridge` (`agent_hub/bridge.py`). Requires `interface.command`. |
+| `internal` | Implemented | In-process dispatch, no subprocess. Used by Agent Hub's self-manifest. |
+| `mcp` | Planned | Declared in the schema; `CLIBridge` currently warns that MCP is not implemented. |
+| `http` | Planned | Declared in the schema; `HTTPBridge` is future work. |
 
 ### Agent Discovery
 
-Agent Hub discovers agents by searching for `agent.yaml` files in:
+Agent Hub loads manifests from the registry directory `agents.d/` (resolved by `_resolve_registry_dir()` in `agent_hub/cli.py`). Register new agents with `agent-hub agent register <project-path>`; edit files under `agents.d/` and run `agent-hub agent reload` to pick up changes.
 
-1. Paths specified in the `AGENT_PATH` environment variable (comma-separated).
-2. Default search paths: `./agents/`, `~/.agent-hub/agents/`.
-3. Paths passed via the `--agent-path` CLI option.
+---
+
+## Model Configuration
+
+Models are declared in `models.yaml`:
+
+```yaml
+models:
+  - name: deepseek-v4-pro
+    provider: deepseek
+    api_base: https://api.deepseek.com
+    api_key: "${DEEPSEEK_API_KEY}"    # env var reference — never plaintext
+    models:
+      - deepseek-v4-pro
+    default: true
+model_priority:
+  - deepseek-v4-pro
+```
+
+`models priority` defines the fallback order when a model is unavailable or rate-limited. Any OpenAI-compatible endpoint works by setting `api_base` accordingly.
 
 ---
 
 ## Readiness Check
 
-Agent Hub performs a three-layer readiness check at startup:
+Startup performs layered readiness checks:
 
 ```
-Layer 1: Welcome Banner
-  ┌────────────────────────────────────────────┐
-  │  Agent Hub v0.x.x                          │
-  │  Multi-Agent Orchestration System          │
-  │  Agents discovered: 3                      │
-  └────────────────────────────────────────────┘
-
-Layer 2: Pre-Execution Check
-  ✓ Agent manifests valid
-  ✓ LLM provider configured
-  ✓ Network connectivity OK
-
-Layer 3: LLM Call Failure Guidance
-  ✗ API call failed: rate limited
-  → Guidance: "You've hit the rate limit.
-    Retry in 30 seconds or switch to a
-    different provider with --llm deepseek"
+Layer 1: Welcome banner — version + discovered agent count
+Layer 2: Pre-execution check — manifests valid, model configured
+Layer 3: LLM failure guidance — actionable hints on API errors
+         (e.g. rate limit → retry or switch provider via models priority)
 ```
 
 ---
 
 ## Testing
 
-Agent Hub includes 30 tests covering:
+The suite holds **465 tests** (`pytest --collect-only`) across five files:
 
-- **Agent Manifest Protocol**: Schema validation, field parsing, optional field defaults.
-- **Real Project agent.yaml Validation**: Validates manifests from omniagent, resume-sync, and SmartBench.
-- **Routing Logic**: Intent parsing, confidence scoring, fallback behavior.
-- **DAG Construction**: Multi-agent dependency resolution, cycle detection.
+| File | Focus |
+|---|---|
+| `tests/test_bridge.py` | CLI bridge, process lifecycle, watchdog restart limits |
+| `tests/test_cron.py` | Cron parsing, scheduling, history persistence |
+| `tests/test_manifest.py` | Manifest schema validation and parsing |
+| `tests/test_router.py` | Intent routing, confidence scoring, rule fallback |
+| `tests/test_session_pid.py` | Session store and PID file management |
 
 ```bash
-# Run all tests
+pip install -e ".[dev]"
 pytest
-
-# Run with coverage
-pytest --cov=agent_hub --cov-report=term-missing
-
-# Run specific test file
-pytest tests/test_manifest.py
 ```
 
 ---
@@ -454,46 +405,24 @@ pytest tests/test_manifest.py
 ## Project Map
 
 ```
-agent-hub/
+Agent-hub/
 ├── agent_hub/                 # Core package
-│   ├── __init__.py
-│   ├── router.py              # Smart routing engine
-│   ├── dag/                   # DAG scheduler
-│   │   ├── builder.py
-│   │   └── executor.py
-│   ├── strategies/            # 7 collaboration strategies
-│   │   ├── fan_out.py
-│   │   ├── debate.py
-│   │   ├── reflection.py
-│   │   ├── vote.py
-│   │   ├── plan_execute.py
-│   │   ├── hitl.py
-│   │   └── pipeline.py
-│   ├── manifest/              # Agent Manifest protocol
-│   │   ├── parser.py
-│   │   └── validator.py
-│   ├── memory/                # Session memory
-│   │   └── session.py
-│   ├── cron/                  # Cron scheduler
-│   │   └── scheduler.py
-│   ├── watchdog/              # Process watchdog
-│   │   └── monitor.py
-│   └── cli/                   # CLI & REPL
-│       ├── main.py
-│       └── repl.py
-├── tests/                     # Test suite (30 tests)
-│   ├── test_manifest.py
-│   ├── test_routing.py
-│   └── test_strategies.py
-├── agents/                    # Sample agent manifests
-│   ├── omniagent/
-│   │   └── agent.yaml
-│   ├── resume-sync/
-│   │   └── agent.yaml
-│   └── SmartBench/
-│       └── agent.yaml
-├── requirements.txt
-├── setup.py
+│   ├── cli.py                 # CLI entry: start/stop/status/run, agent/models/schedule groups, REPL
+│   ├── router.py              # LLM intent router: optimization, strategy inference, confidence, rule fallback
+│   ├── scheduler.py           # DAG scheduler: Kahn waves + 7 strategy executors
+│   ├── bridge.py              # CLIBridge: subprocess lifecycle + watchdog auto-heal
+│   ├── manifest.py            # agent.yaml parsing & validation
+│   ├── llm.py                 # OpenAI-compatible LLM client (reasoning-model aware)
+│   ├── model_config.py        # models.yaml management
+│   ├── session_store.py       # Session persistence (keep last 50)
+│   ├── pid_store.py           # PID file management
+│   ├── cron.py                # Pure-Python cron engine (no external deps)
+│   └── dashboard.py           # Rich multi-panel TUI dashboard
+├── agents.d/                  # Registered agent manifests (agent-hub / omniagent / resume-sync / smartbench)
+├── agent.yaml                 # Agent Hub's own self-manifest
+├── models.yaml                # Model registry + priority
+├── tests/                     # 465 tests
+├── pyproject.toml             # Packaging: `agent-hub` console script
 └── README.md
 ```
 
@@ -501,34 +430,28 @@ agent-hub/
 
 ## FAQ
 
-**Q: How is Agent Hub different from other agent frameworks (LangChain, AutoGen, CrewAI)?**
+**Q: How is Agent Hub different from LangChain / AutoGen / CrewAI?**
 
-Agent Hub is designed around **zero-intrusion** and **decoupled discovery**. Unlike frameworks that require you to import SDKs or subclass base classes, Agent Hub simply reads `agent.yaml` files from existing projects. It's an orchestrator, not a framework — your agents remain completely independent.
+Agent Hub is built around **zero-intrusion discovery**. Frameworks ask you to import SDKs or subclass base classes; Agent Hub only reads an `agent.yaml` from each existing project. It is an orchestrator, not a framework — your agents stay fully independent.
 
 **Q: Can I add my own agent without modifying Agent Hub?**
 
-Yes. Write an `agent.yaml` file in your project root, place it somewhere Agent Hub can discover it (via `AGENT_PATH` or `--agent-path`), and Agent Hub will automatically detect it. Zero code changes to Agent Hub or your project.
+Yes. Write an `agent.yaml` in your project root, then run `agent-hub agent register /path/to/your/project`. Zero code changes on either side.
 
 **Q: What LLM providers are supported?**
 
-Agent Hub is provider-agnostic. It can work with OpenAI, DeepSeek, Anthropic Claude, Google Gemini, Qwen, Ollama (local), and any OpenAI-compatible API endpoint.
+Any OpenAI-compatible endpoint. DeepSeek is the default preset; set `api_base` in `models.yaml` to point at OpenAI, Anthropic-compatible proxies, local Ollama, etc.
 
-**Q: How does the DAG scheduler handle failures?**
+**Q: How does the scheduler handle agent crashes?**
 
-The watchdog monitors all running processes. If a process crashes, it attempts up to 3 restarts within 5 minutes. If exceeded, the agent is marked as failed. The DAG executor receives the failure status and can trigger fallback strategies or notify the user.
+The watchdog scans every 15 seconds. A crashed agent with `desired_state == "running"` is restarted automatically, up to 3 times within 300 seconds. Beyond that it is marked failed and surfaced in the status panel.
 
-**Q: Can I use Agent Hub for production workloads?**
+**Q: Is Agent Hub production-ready?**
 
-Agent Hub is currently in **beta**. It has been tested with 30 tests covering core protocols and real agent manifests, but production use may require additional hardening for your specific environment.
+It is in **beta**: 465 tests cover the bridge, cron, manifest, router, and session layers, and it orchestrates three real projects (OmniAgent, resume-sync, SmartBench) daily. The `mcp` and `http` protocols are schema-declared but not yet implemented — treat manifests declaring them as forward-compatible.
 
 ---
 
 ## License
 
 [MIT](LICENSE) © Xianyu Sheng
-
----
-
-<p align="center">
-  <sub>Built with ❤️ for the open-source AI agent community</sub>
-</p>

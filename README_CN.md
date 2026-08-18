@@ -201,7 +201,7 @@ agent-hub schedule history                           # 查看执行历史 (最�
 
 ```bash
 agent-hub run "分析代码并更新简历"  # 带仪表盘的多 Agent 调度（自动选择协作策略）
-agent-hub run --no-dashboard "..." # 纯命令行模式
+agent-hub run "..."                # 默认流式输出（无仪表盘）；加 -d/--dashboard 启用多面板 TUI
 agent-hub run                      # 交互式任务模式
 ```
 
@@ -395,7 +395,7 @@ Agent Hub 不只是把任务分派给 Agent，它根据任务性质**自动选�
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/ -v           # 30 tests (manifest 协议全覆盖 + 真实项目 agent.yaml 验证)
+pytest                     # 465 tests: bridge(161) + cron(57) + manifest(28) + router(143) + session_pid(74)
 ```
 
 ---
